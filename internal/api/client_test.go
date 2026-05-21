@@ -172,6 +172,33 @@ func TestPublishTarget_Conflict(t *testing.T) {
 	}
 }
 
+func TestRotateRoot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/user_repo/rid-1/root/rotate" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(RotateRootResponse{
+			NewRootVersion:   2,
+			NewRootKeyID:     "newkey",
+			PriorRootKeyID:   "oldkey",
+			PriorRootVersion: 1,
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).RotateRoot(context.Background(), "rid-1", RotateRootRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NewRootVersion != 2 || got.PriorRootKeyID != "oldkey" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

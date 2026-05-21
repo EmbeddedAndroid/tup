@@ -25,6 +25,7 @@ Commands:
   namespace create <name>               Create a new namespace
   namespace list                        List all namespaces
   namespace show <repo-id>              Show the signed root role for a namespace
+  namespace rotate <repo-id>            Rotate the root key (server-side dual-key)
   publish <repo-id> <name> <version>    Publish a new target into a namespace
   version                               Print version
   help                                  Show this help
@@ -287,7 +288,7 @@ func parseAppPairs(s string) map[string]string {
 
 func runNamespace(ctx context.Context, c *api.Client, args []string, out output) {
 	if len(args) == 0 {
-		fail(fmt.Errorf("namespace needs a subcommand: create | list | show"))
+		fail(fmt.Errorf("namespace needs a subcommand: create | list | show | rotate"))
 	}
 	switch args[0] {
 	case "create":
@@ -314,9 +315,29 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 			fail(err)
 		}
 		out.namespaceRoot(args[1], checksum, body)
+	case "rotate":
+		runNamespaceRotate(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+func runNamespaceRotate(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("namespace rotate needs a repo-id"))
+	}
+	repoID := args[0]
+
+	fs := flag.NewFlagSet("rotate", flag.ExitOnError)
+	keyType := fs.String("key-type", "", "key algorithm for the new root (default: same as current)")
+	if err := fs.Parse(args[1:]); err != nil {
+		fail(err)
+	}
+	resp, err := c.RotateRoot(ctx, repoID, api.RotateRootRequest{KeyType: *keyType})
+	if err != nil {
+		fail(err)
+	}
+	out.rotateResult(resp)
 }
 
 // output wraps text-vs-json formatting in one place.
@@ -357,6 +378,16 @@ func (o output) namespaceCreated(r *api.CreateResponse) {
 	fmt.Printf("  repo_id:      %s\n", r.RepoID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
+}
+
+func (o output) rotateResult(r *api.RotateRootResponse) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(r)
+		return
+	}
+	fmt.Printf("rotated: v%d -> v%d\n", r.PriorRootVersion, r.NewRootVersion)
+	fmt.Printf("  new keyid:   %s\n", r.NewRootKeyID)
+	fmt.Printf("  prior keyid: %s\n", r.PriorRootKeyID)
 }
 
 func (o output) publishResult(r *api.PublishResponse) {

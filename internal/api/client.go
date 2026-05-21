@@ -110,6 +110,42 @@ type PublishResponse struct {
 	TimestampVersion int    `json:"timestamp_version"`
 }
 
+// RotateRootResponse mirrors tufd's rotator.Response shape.
+type RotateRootResponse struct {
+	NewRootVersion   int    `json:"new_root_version"`
+	NewRootKeyID     string `json:"new_root_keyid"`
+	PriorRootKeyID   string `json:"prior_root_keyid"`
+	PriorRootVersion int    `json:"prior_root_version"`
+}
+
+// RotateRootRequest matches tufd's RotateRootRequest body shape. KeyType
+// is optional; empty inherits the current key's algorithm.
+type RotateRootRequest struct {
+	KeyType string `json:"key_type,omitempty"`
+}
+
+// RotateRoot generates a new root key for repoID, co-signs a new Root
+// role at v+1 with both old and new keys, and returns the version chain.
+// A 409 means the namespace has no root yet (only possible on a broken
+// bootstrap); a 5xx means something failed mid-flight.
+func (c *Client) RotateRoot(ctx context.Context, repoID string, req RotateRootRequest) (*RotateRootResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/root/rotate", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("rotate root", resp)
+	}
+	var out RotateRootResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode rotate: %w", err)
+	}
+	return &out, nil
+}
+
 // PublishTarget posts a new target entry and returns the resulting role
 // versions. A 409 surfaces as an *Error with Status=409.
 func (c *Client) PublishTarget(ctx context.Context, repoID string, req PublishRequest) (*PublishResponse, error) {
