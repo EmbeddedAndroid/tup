@@ -11,15 +11,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/foundriesio/fioup/internal/api"
+	"github.com/foundriesio/tup/internal/api"
 )
 
 var Version = "dev"
 
-const help = `fioup — Foundries.io on-prem OTA stack CLI
+const help = `tup — Foundries.io on-prem OTA stack CLI
 
 Usage:
-  fioup [flags] <command> [args...]
+  tup [flags] <command> [args...]
 
 Commands:
   factory create <name>         Create a new factory
@@ -29,18 +29,18 @@ Commands:
   help                          Show this help
 
 Global flags:
-  -url <URL>                    fiotufd base URL (default $FIOUP_URL or http://localhost:9001)
+  -url <URL>                    tufd base URL (default $TUP_URL or http://localhost:9001)
   -json                         JSON output (for agents and scripts)
   -timeout <duration>           Request timeout (default 30s)
 
 Examples:
-  fioup factory create acme
-  fioup -json factory list
-  fioup -url https://fiotufd.internal:9001 factory show 0d9eaef2-1234-...
+  tup factory create acme
+  tup -json factory list
+  tup -url https://tufd.internal:9001 factory show 0d9eaef2-1234-...
 `
 
 func main() {
-	url := flag.String("url", envOr("FIOUP_URL", "http://localhost:9001"), "fiotufd base URL")
+	url := flag.String("url", envOr("TUP_URL", "http://localhost:9001"), "tufd base URL")
 	jsonOut := flag.Bool("json", false, "output JSON")
 	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, help) }
@@ -81,13 +81,13 @@ func runFactory(ctx context.Context, c *api.Client, args []string, out output) {
 		if len(args) < 2 {
 			fail(fmt.Errorf("factory create needs a name"))
 		}
-		resp, err := c.CreateFactory(ctx, api.CreateRequest{Name: args[1]})
+		resp, err := c.CreateNamespace(ctx, api.CreateRequest{Name: args[1]})
 		if err != nil {
 			fail(err)
 		}
 		out.factoryCreated(resp)
 	case "list":
-		facts, err := c.ListFactories(ctx)
+		facts, err := c.ListNamespaces(ctx)
 		if err != nil {
 			fail(err)
 		}
@@ -161,7 +161,7 @@ func (o output) factoryRoot(repoID, checksum string, body []byte) {
 }
 
 func fail(err error) {
-	fmt.Fprintln(os.Stderr, "fioup:", err)
+	fmt.Fprintln(os.Stderr, "tup:", err)
 	if strings.Contains(err.Error(), "status=4") {
 		os.Exit(3) // client error
 	}

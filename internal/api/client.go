@@ -1,6 +1,6 @@
-// Package api is fioup's HTTP client for the fiotufd backend.
+// Package api is tup's HTTP client for the tufd backend.
 // Exact wire shape — no transformations, no caching, no retries.
-// fioup is a thin orchestrator; everything interesting happens server-side.
+// tup is a thin orchestrator; everything interesting happens server-side.
 package api
 
 import (
@@ -25,7 +25,7 @@ func New(baseURL string) *Client {
 	}
 }
 
-// Factory matches fiotufd's FactoryListEntry.
+// Factory matches tufd's NamespaceListEntry.
 type Factory struct {
 	RepoID            string `json:"repo_id"`
 	Name              string `json:"name"`
@@ -45,7 +45,7 @@ type CreateResponse struct {
 	RootVersion int    `json:"root_version"`
 }
 
-func (c *Client) ListFactories(ctx context.Context) ([]Factory, error) {
+func (c *Client) ListNamespaces(ctx context.Context) ([]Factory, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo", nil)
 	if err != nil {
 		return nil, err
@@ -63,7 +63,7 @@ func (c *Client) ListFactories(ctx context.Context) ([]Factory, error) {
 	return out.Factories, nil
 }
 
-func (c *Client) CreateFactory(ctx context.Context, req CreateRequest) (*CreateResponse, error) {
+func (c *Client) CreateNamespace(ctx context.Context, req CreateRequest) (*CreateResponse, error) {
 	body, _ := json.Marshal(req)
 	resp, err := c.do(ctx, http.MethodPost, "/api/v1/user_repo", body)
 	if err != nil {

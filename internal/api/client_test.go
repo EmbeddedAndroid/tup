@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestListFactories(t *testing.T) {
+func TestListNamespaces(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/user_repo" || r.Method != http.MethodGet {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
@@ -23,7 +23,7 @@ func TestListFactories(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := New(srv.URL).ListFactories(context.Background())
+	got, err := New(srv.URL).ListNamespaces(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestListFactories(t *testing.T) {
 	}
 }
 
-func TestCreateFactory(t *testing.T) {
+func TestCreateNamespace(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/user_repo" || r.Method != http.MethodPost {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
@@ -49,7 +49,7 @@ func TestCreateFactory(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := New(srv.URL).CreateFactory(context.Background(), CreateRequest{Name: "acme"})
+	got, err := New(srv.URL).CreateNamespace(context.Background(), CreateRequest{Name: "acme"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestStatusError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL).ListFactories(context.Background())
+	_, err := New(srv.URL).ListNamespaces(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
