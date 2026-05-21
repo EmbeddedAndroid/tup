@@ -22,21 +22,32 @@ Usage:
   tup [flags] <command> [args...]
 
 Commands:
-  factory create <name>         Create a new factory
-  factory list                  List all factories
-  factory show <repo-id>        Show the signed root role for a factory
-  version                       Print version
-  help                          Show this help
+  factory create <name>                 Create a new factory
+  factory list                          List all factories
+  factory show <repo-id>                Show the signed root role for a factory
+  publish <repo-id> <name> <version>    Publish a new target into a factory
+  version                               Print version
+  help                                  Show this help
 
 Global flags:
   -url <URL>                    tufd base URL (default $TUP_URL or http://localhost:9001)
   -json                         JSON output (for agents and scripts)
   -timeout <duration>           Request timeout (default 30s)
 
+publish flags:
+  -sha256 <hex>                 sha256 of the target artifact (required)
+  -length <int>                 byte length; 0 for OSTREE targets
+  -hardware <h1,h2,...>         comma-separated hardware ids
+  -tags <t1,t2,...>             comma-separated tag list
+  -format <OSTREE|BINARY>       target format; default OSTREE
+  -uri <url>                    artifact URI
+  -app <name=uri[,name=uri...]> docker-compose apps for this target
+
 Examples:
   tup factory create acme
   tup -json factory list
   tup -url https://tufd.internal:9001 factory show 0d9eaef2-1234-...
+  tup publish demo lmp 42 -sha256 abc123... -hardware intel-corei7-64 -tags main
 `
 
 func main() {
@@ -67,9 +78,84 @@ func main() {
 		fmt.Fprint(os.Stderr, help)
 	case "factory":
 		runFactory(ctx, client, args[1:], out)
+	case "publish":
+		runPublish(ctx, client, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown command: %s", args[0]))
 	}
+}
+
+func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 3 {
+		fail(fmt.Errorf("publish needs: <repo-id> <name> <version> [flags]"))
+	}
+	repoID, name, version := args[0], args[1], args[2]
+
+	fs := flag.NewFlagSet("publish", flag.ExitOnError)
+	sha256 := fs.String("sha256", "", "sha256 hex of the target artifact (required)")
+	length := fs.Int64("length", 0, "byte length; 0 for OSTREE")
+	hardware := fs.String("hardware", "", "comma-separated hardware ids")
+	tags := fs.String("tags", "", "comma-separated tags")
+	format := fs.String("format", "OSTREE", "OSTREE | BINARY")
+	uri := fs.String("uri", "", "artifact URI")
+	apps := fs.String("app", "", "compose apps name=uri[,name=uri...]")
+	if err := fs.Parse(args[3:]); err != nil {
+		fail(err)
+	}
+	if *sha256 == "" {
+		fail(fmt.Errorf("publish: -sha256 is required"))
+	}
+
+	req := api.PublishRequest{
+		Name:         name,
+		Version:      version,
+		SHA256:       *sha256,
+		Length:       *length,
+		HardwareIDs:  splitCSV(*hardware),
+		Tags:         splitCSV(*tags),
+		TargetFormat: *format,
+		URI:          *uri,
+		ComposeApps:  parseAppPairs(*apps),
+	}
+	resp, err := c.PublishTarget(ctx, repoID, req)
+	if err != nil {
+		fail(err)
+	}
+	out.publishResult(resp)
+}
+
+// splitCSV splits a comma-separated list, dropping empty entries.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parseAppPairs turns "web=ghcr.io/acme/web:1,db=ghcr.io/acme/db:2" into a
+// {web: ghcr.io/.../web:1, db: ...} map.
+func parseAppPairs(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, p := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) == 2 && kv[0] != "" && kv[1] != "" {
+			out[kv[0]] = kv[1]
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func runFactory(ctx context.Context, c *api.Client, args []string, out output) {
@@ -144,6 +230,17 @@ func (o output) factoryCreated(r *api.CreateResponse) {
 	fmt.Printf("  repo_id:      %s\n", r.RepoID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
+}
+
+func (o output) publishResult(r *api.PublishResponse) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(r)
+		return
+	}
+	fmt.Printf("published %s\n", r.TargetKey)
+	fmt.Printf("  targets:   v%d\n", r.TargetsVersion)
+	fmt.Printf("  snapshot:  v%d\n", r.SnapshotVersion)
+	fmt.Printf("  timestamp: v%d\n", r.TimestampVersion)
 }
 
 func (o output) factoryRoot(repoID, checksum string, body []byte) {

@@ -80,6 +80,49 @@ func (c *Client) CreateNamespace(ctx context.Context, req CreateRequest) (*Creat
 	return &out, nil
 }
 
+// PublishRequest matches tufd's PublishRequest body shape.
+type PublishRequest struct {
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	HardwareIDs  []string          `json:"hardware_ids,omitempty"`
+	Tags         []string          `json:"tags,omitempty"`
+	TargetFormat string            `json:"target_format,omitempty"`
+	SHA256       string            `json:"sha256"`
+	Length       int64             `json:"length,omitempty"`
+	URI          string            `json:"uri,omitempty"`
+	ComposeApps  map[string]string `json:"compose_apps,omitempty"`
+}
+
+// PublishResponse matches tufd's publisher.Response shape.
+type PublishResponse struct {
+	TargetKey        string `json:"target_key"`
+	TargetsVersion   int    `json:"targets_version"`
+	SnapshotVersion  int    `json:"snapshot_version"`
+	TimestampVersion int    `json:"timestamp_version"`
+}
+
+// PublishTarget posts a new target entry and returns the resulting role
+// versions. A 409 surfaces as an *Error with Status=409.
+func (c *Client) PublishTarget(ctx context.Context, repoID string, req PublishRequest) (*PublishResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("api: marshal publish: %w", err)
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/api/v1/user_repo/"+repoID+"/targets", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("publish target", resp)
+	}
+	var out PublishResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode publish: %w", err)
+	}
+	return &out, nil
+}
+
 // FetchRoot returns the raw signed root role for a factory and the
 // x-ats-role-checksum value the server advertises.
 func (c *Client) FetchRoot(ctx context.Context, repoID string) ([]byte, string, error) {

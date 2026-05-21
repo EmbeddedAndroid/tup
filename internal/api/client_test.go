@@ -80,6 +80,65 @@ func TestFetchRoot(t *testing.T) {
 	}
 }
 
+func TestPublishTarget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/user_repo/rid-1/targets" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var got PublishRequest
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		if got.Name != "lmp" || got.Version != "42" || got.SHA256 != "abc" {
+			t.Errorf("body decoded as %+v", got)
+		}
+		if len(got.HardwareIDs) != 1 || got.HardwareIDs[0] != "intel-corei7-64" {
+			t.Errorf("HardwareIDs = %v", got.HardwareIDs)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(PublishResponse{
+			TargetKey: "lmp-42", TargetsVersion: 2, SnapshotVersion: 2, TimestampVersion: 2000,
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).PublishTarget(context.Background(), "rid-1", PublishRequest{
+		Name: "lmp", Version: "42", SHA256: "abc",
+		HardwareIDs: []string{"intel-corei7-64"}, Tags: []string{"main"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TargetKey != "lmp-42" || got.TargetsVersion != 2 || got.TimestampVersion != 2000 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestPublishTarget_Conflict guards the duplicate-publish path: a 409 from
+// tufd must surface as an *Error so callers can branch on it.
+func TestPublishTarget_Conflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"target already exists","key":"lmp-42"}`))
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL).PublishTarget(context.Background(), "rid-1", PublishRequest{
+		Name: "lmp", Version: "42", SHA256: "abc",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *Error
+	if !errorsAs(err, &apiErr) {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if apiErr.Status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", apiErr.Status)
+	}
+}
+
 func TestStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
