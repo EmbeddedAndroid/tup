@@ -262,6 +262,69 @@ func TestFinalizeRotation(t *testing.T) {
 	}
 }
 
+func TestBootstrapStage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user_repo/_bootstrap-stage" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var req BootstrapStageRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Name != "acme" || req.RootPublicKeyPEM == "" {
+			t.Errorf("body = %+v", req)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(BootstrapStageResponse{
+			StagingID: "stage1", RepoID: "rid-1", Name: "acme",
+			RootKeyID: "rootK", TargetsKeyID: "tK",
+			SnapshotKeyID: "sK", TimestampKeyID: "tsK",
+			BytesToSign:    []byte(`{"_type":"Root","version":1}`),
+			RequiredKeyIDs: []string{"rootK"},
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).BootstrapStage(context.Background(), BootstrapStageRequest{
+		Name:             "acme",
+		RootPublicKeyPEM: "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StagingID != "stage1" || got.RepoID != "rid-1" || got.RootKeyID != "rootK" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestBootstrapFinalize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user_repo/_bootstrap-finalize" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var req BootstrapFinalizeRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.StagingID == "" || len(req.Envelope) == 0 {
+			t.Error("missing fields")
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(CreateResponse{
+			RepoID: "rid-1", Name: "acme",
+			RootKeyID: "rootK", RootVersion: 1,
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).BootstrapFinalize(context.Background(), BootstrapFinalizeRequest{
+		StagingID: "stage1",
+		Envelope:  []byte(`{"signatures":[],"signed":""}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RepoID != "rid-1" || got.RootVersion != 1 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

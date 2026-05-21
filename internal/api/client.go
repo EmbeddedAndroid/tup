@@ -124,6 +124,78 @@ type RotateRootRequest struct {
 	KeyType string `json:"key_type,omitempty"`
 }
 
+// BootstrapStageRequest creates a new namespace with a customer-held
+// offline root key. Server mints the targets/snapshot/timestamp online
+// keys and stages a candidate Root v=1; customer signs offline; POSTs
+// the envelope back via BootstrapFinalize.
+type BootstrapStageRequest struct {
+	Name             string `json:"name"`
+	RootPublicKeyPEM string `json:"root_pubkey_pem"`
+	RootKeyType      string `json:"root_keytype,omitempty"`
+	RootScheme       string `json:"root_scheme,omitempty"`
+}
+
+// BootstrapStageResponse mirrors tufd's BeginExternalRootResponse.
+type BootstrapStageResponse struct {
+	StagingID      string   `json:"staging_id"`
+	RepoID         string   `json:"repo_id"`
+	Name           string   `json:"name"`
+	RootKeyID      string   `json:"root_keyid"`
+	TargetsKeyID   string   `json:"targets_keyid"`
+	SnapshotKeyID  string   `json:"snapshot_keyid"`
+	TimestampKeyID string   `json:"timestamp_keyid"`
+	BytesToSign    []byte   `json:"bytes_to_sign"`
+	RequiredKeyIDs []string `json:"required_keyids"`
+	ExpiresAt      string   `json:"expires_at"`
+}
+
+// BootstrapStage POSTs to /api/v1/user_repo/_bootstrap-stage. The
+// namespace is NOT yet visible to /api/v1/user_repo until
+// BootstrapFinalize completes.
+func (c *Client) BootstrapStage(ctx context.Context, req BootstrapStageRequest) (*BootstrapStageResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/_bootstrap-stage", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("bootstrap stage", resp)
+	}
+	var out BootstrapStageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode bootstrap stage: %w", err)
+	}
+	return &out, nil
+}
+
+// BootstrapFinalizeRequest carries the signed envelope back.
+type BootstrapFinalizeRequest struct {
+	StagingID string `json:"staging_id"`
+	Envelope  []byte `json:"envelope"`
+}
+
+// BootstrapFinalize POSTs the signed envelope; on success the
+// namespace is live. Response is the standard CreateResponse shape.
+func (c *Client) BootstrapFinalize(ctx context.Context, req BootstrapFinalizeRequest) (*CreateResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/_bootstrap-finalize", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("bootstrap finalize", resp)
+	}
+	var out CreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode bootstrap finalize: %w", err)
+	}
+	return &out, nil
+}
+
 // StageRotationRequest matches tufd's offline-stage body.
 type StageRotationRequest struct {
 	NewPublicKeyPEM string `json:"new_pubkey_pem"`

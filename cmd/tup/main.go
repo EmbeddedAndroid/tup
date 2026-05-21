@@ -34,10 +34,16 @@ Commands:
   namespace list                                List all namespaces
   namespace show <repo-id>                      Show the signed root role for a namespace
   namespace rotate <repo-id>                    Rotate the root key (server-side dual-key)
+  namespace create-with-key --name <n> --root-pubkey <file>
+                                                Bootstrap with a customer-held offline root key (cold-key)
+  namespace finalize-create --staging-id <id> --signed <file>
+                                                POST signed envelope to finalize cold-key bootstrap
   namespace stage-rotation <repo-id> --new-pubkey <file>
                                                 Start an offline rotation; downloads bytes-to-sign
   sign-rotation --tosign <file> --old-key <pem> --new-key <pem> -o <file>
-                                                Locally sign a staged rotation envelope
+                                                Locally sign a staged rotation envelope (2 keys)
+  sign-bootstrap --tosign <file> --key <pem> -o <file>
+                                                Locally sign a staged bootstrap envelope (1 key)
   namespace finalize-rotation <repo-id> --signed <file>
                                                 POST a customer-signed envelope to commit the rotation
   publish <repo-id> <name> <version>            Publish a new target into a namespace
@@ -113,6 +119,11 @@ func main() {
 		// might run it on an air-gapped HSM host where -url isn't
 		// even meaningful.
 		runSignRotation(args[1:])
+	case "sign-bootstrap":
+		// Single-key variant of sign-rotation for the cold-key
+		// bootstrap flow (only the new root key signs v=1; there's
+		// no prior root to co-sign with).
+		runSignBootstrap(args[1:])
 	default:
 		fail(fmt.Errorf("unknown command: %s", args[0]))
 	}
@@ -341,9 +352,112 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runStageRotation(ctx, c, args[1:], out)
 	case "finalize-rotation":
 		runFinalizeRotation(ctx, c, args[1:], out)
+	case "create-with-key":
+		runCreateWithKey(ctx, c, args[1:], out)
+	case "finalize-create":
+		runFinalizeCreate(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runCreateWithKey: POST /api/v1/user_repo/_bootstrap-stage with the
+// customer's pre-generated root pubkey. Writes tosign-<staging>.json
+// for the offline signing step.
+func runCreateWithKey(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("create-with-key", flag.ExitOnError)
+	name := fs.String("name", "", "human-readable namespace label (required)")
+	pubkey := fs.String("root-pubkey", "", "PEM SPKI file for the customer's offline root key (required)")
+	outDir := fs.String("out-dir", ".", "directory to write tosign file into")
+	keytype := fs.String("root-keytype", "ed25519", "ed25519 | rsa-4096")
+	scheme := fs.String("root-scheme", "", "signature scheme (defaults to keytype's standard)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if *name == "" || *pubkey == "" {
+		fail(fmt.Errorf("create-with-key: --name and --root-pubkey are required"))
+	}
+	pubBytes, err := os.ReadFile(*pubkey)
+	if err != nil {
+		fail(fmt.Errorf("create-with-key: read pubkey: %w", err))
+	}
+	resp, err := c.BootstrapStage(ctx, api.BootstrapStageRequest{
+		Name:             *name,
+		RootPublicKeyPEM: string(pubBytes),
+		RootKeyType:      *keytype,
+		RootScheme:       *scheme,
+	})
+	if err != nil {
+		fail(err)
+	}
+	tosignPath := filepath.Join(*outDir, "tosign-bootstrap-"+resp.StagingID+".json")
+	if err := os.WriteFile(tosignPath, resp.BytesToSign, 0o644); err != nil {
+		fail(fmt.Errorf("create-with-key: write tosign file: %w", err))
+	}
+	out.bootstrapStageResult(resp, tosignPath)
+}
+
+func runFinalizeCreate(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("finalize-create", flag.ExitOnError)
+	stagingID := fs.String("staging-id", "", "staging_id from `create-with-key` (required)")
+	signed := fs.String("signed", "", "path to the signed envelope JSON (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if *stagingID == "" || *signed == "" {
+		fail(fmt.Errorf("finalize-create: --staging-id and --signed required"))
+	}
+	envBytes, err := os.ReadFile(*signed)
+	if err != nil {
+		fail(fmt.Errorf("finalize-create: read envelope: %w", err))
+	}
+	resp, err := c.BootstrapFinalize(ctx, api.BootstrapFinalizeRequest{
+		StagingID: *stagingID,
+		Envelope:  envBytes,
+	})
+	if err != nil {
+		fail(err)
+	}
+	out.namespaceCreated(resp)
+}
+
+// runSignBootstrap: single-key variant of sign-rotation. The cold-key
+// bootstrap envelope only needs the new root key's signature (there's
+// no prior root to co-sign).
+func runSignBootstrap(args []string) {
+	fs := flag.NewFlagSet("sign-bootstrap", flag.ExitOnError)
+	tosignPath := fs.String("tosign", "", "tosign file from `namespace create-with-key` (required)")
+	keyPath := fs.String("key", "", "PEM PKCS#8 private key (required)")
+	outPath := fs.String("o", "signed-bootstrap.json", "envelope output file")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if *tosignPath == "" || *keyPath == "" {
+		fail(fmt.Errorf("sign-bootstrap: --tosign and --key required"))
+	}
+	tosign, err := os.ReadFile(*tosignPath)
+	if err != nil {
+		fail(fmt.Errorf("sign-bootstrap: read tosign: %w", err))
+	}
+	sig, err := signCanonicalWithPEM(tosign, *keyPath)
+	if err != nil {
+		fail(fmt.Errorf("sign-bootstrap: %w", err))
+	}
+	envelope := map[string]any{
+		"signatures": []map[string]string{
+			{"keyid": sig.KeyID, "sig": sig.Sig},
+		},
+		"signed": json.RawMessage(tosign),
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		fail(err)
+	}
+	if err := os.WriteFile(*outPath, body, 0o600); err != nil {
+		fail(fmt.Errorf("sign-bootstrap: write envelope: %w", err))
+	}
+	fmt.Printf("signed envelope written to %s\n", *outPath)
+	fmt.Printf("  keyid: %s\n", sig.KeyID)
 }
 
 // runStageRotation: POST /root/stage with the customer's new pubkey.
@@ -589,6 +703,36 @@ func (o output) namespaceCreated(r *api.CreateResponse) {
 	fmt.Printf("  repo_id:      %s\n", r.RepoID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
+}
+
+func (o output) bootstrapStageResult(r *api.BootstrapStageResponse, tosignPath string) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"staging_id":       r.StagingID,
+			"repo_id":          r.RepoID,
+			"name":             r.Name,
+			"root_keyid":       r.RootKeyID,
+			"targets_keyid":    r.TargetsKeyID,
+			"snapshot_keyid":   r.SnapshotKeyID,
+			"timestamp_keyid":  r.TimestampKeyID,
+			"required_keyids":  r.RequiredKeyIDs,
+			"expires_at":       r.ExpiresAt,
+			"tosign_file":      tosignPath,
+		})
+		return
+	}
+	fmt.Printf("staged namespace bootstrap: %q\n", r.Name)
+	fmt.Printf("  repo_id:           %s\n", r.RepoID)
+	fmt.Printf("  staging_id:        %s\n", r.StagingID)
+	fmt.Printf("  expires:           %s\n", r.ExpiresAt)
+	fmt.Printf("  root keyid:        %s  (offline; you sign with this)\n", r.RootKeyID)
+	fmt.Printf("  targets keyid:     %s  (online, server-held)\n", r.TargetsKeyID)
+	fmt.Printf("  snapshot keyid:    %s  (online, server-held)\n", r.SnapshotKeyID)
+	fmt.Printf("  timestamp keyid:   %s  (online, server-held)\n", r.TimestampKeyID)
+	fmt.Printf("  bytes to sign:     %s (%d bytes)\n", tosignPath, len(r.BytesToSign))
+	fmt.Printf("\nNext:\n")
+	fmt.Printf("  tup sign-bootstrap --tosign %s --key ROOT.pem -o signed.json\n", tosignPath)
+	fmt.Printf("  tup namespace finalize-create --staging-id %s --signed signed.json\n", r.StagingID)
 }
 
 func (o output) stageRotationResult(r *api.StageRotationResponse, tosignPath string) {
