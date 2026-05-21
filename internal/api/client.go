@@ -91,7 +91,15 @@ type PublishRequest struct {
 	SHA256       string            `json:"sha256"`
 	Length       int64             `json:"length,omitempty"`
 	URI          string            `json:"uri,omitempty"`
+	OrigURI      string            `json:"orig_uri,omitempty"`
+	ImageFile    string            `json:"image_file,omitempty"`
 	ComposeApps  map[string]string `json:"compose_apps,omitempty"`
+
+	// LmP build provenance (optional).
+	LMPVer                     string `json:"lmp_ver,omitempty"`
+	LMPManifestSHA             string `json:"lmp_manifest_sha,omitempty"`
+	MetaSubscriberOverridesSHA string `json:"meta_subscriber_overrides_sha,omitempty"`
+	ContainersSHA              string `json:"containers_sha,omitempty"`
 }
 
 // PublishResponse matches tufd's publisher.Response shape.

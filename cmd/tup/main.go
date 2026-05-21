@@ -35,19 +35,31 @@ Global flags:
   -timeout <duration>           Request timeout (default 30s)
 
 publish flags:
-  -sha256 <hex>                 sha256 of the target artifact (required)
+  -sha256 <hex>                 sha256 of the target artifact (required;
+                                for OSTREE this is the commit hash)
+  -ostree-commit <hex>          alias for -sha256; also forces -format OSTREE
+                                and -length 0
   -length <int>                 byte length; 0 for OSTREE targets
   -hardware <h1,h2,...>         comma-separated hardware ids
   -tags <t1,t2,...>             comma-separated tag list
   -format <OSTREE|BINARY>       target format; default OSTREE
-  -uri <url>                    artifact URI
+  -uri <url>                    artifact URI (devices fetch the artifact here)
+  -orig-uri <url>               upstream build URL (e.g. Foundries CI)
+  -image-file <name>            artifact filename (e.g. lmp-base-…wic.gz)
   -app <name=uri[,name=uri...]> docker-compose apps for this target
+  -lmp-ver <n>                  LmP version label
+  -lmp-manifest-sha <hex>       lmp-manifest git sha at build time
+  -meta-sha <hex>               meta-subscriber-overrides git sha at build time
+  -containers-sha <hex>         containers.git sha at build time
+  -manifest <path>              load a build manifest (JSON) for any of the
+                                above; explicit flags override
 
 Examples:
   tup namespace create acme
   tup -json namespace list
   tup -url https://tufd.internal:9001 namespace show 0d9eaef2-1234-...
   tup publish demo lmp 42 -sha256 abc123... -hardware intel-corei7-64 -tags main
+  tup publish demo lmp 98 -manifest build-98.json -hardware intel-corei7-64
 `
 
 func main() {
@@ -92,36 +104,151 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	repoID, name, version := args[0], args[1], args[2]
 
 	fs := flag.NewFlagSet("publish", flag.ExitOnError)
-	sha256 := fs.String("sha256", "", "sha256 hex of the target artifact (required)")
+	manifestPath := fs.String("manifest", "", "load a build manifest JSON (LmP fields)")
+	sha256 := fs.String("sha256", "", "sha256 hex of the target artifact")
+	ostreeCommit := fs.String("ostree-commit", "", "ostree commit hash (alias for -sha256, forces OSTREE format)")
 	length := fs.Int64("length", 0, "byte length; 0 for OSTREE")
 	hardware := fs.String("hardware", "", "comma-separated hardware ids")
 	tags := fs.String("tags", "", "comma-separated tags")
 	format := fs.String("format", "OSTREE", "OSTREE | BINARY")
 	uri := fs.String("uri", "", "artifact URI")
+	origURI := fs.String("orig-uri", "", "upstream build URL")
+	imageFile := fs.String("image-file", "", "artifact filename")
 	apps := fs.String("app", "", "compose apps name=uri[,name=uri...]")
+	lmpVer := fs.String("lmp-ver", "", "LmP version label")
+	lmpManifestSHA := fs.String("lmp-manifest-sha", "", "lmp-manifest git sha")
+	metaSHA := fs.String("meta-sha", "", "meta-subscriber-overrides git sha")
+	containersSHA := fs.String("containers-sha", "", "containers.git sha")
 	if err := fs.Parse(args[3:]); err != nil {
 		fail(err)
 	}
-	if *sha256 == "" {
-		fail(fmt.Errorf("publish: -sha256 is required"))
+
+	// Build the base request from the manifest (if any), then layer
+	// explicit flags on top — flags always win.
+	req := api.PublishRequest{Name: name, Version: version, TargetFormat: "OSTREE"}
+	if *manifestPath != "" {
+		loaded, err := loadManifest(*manifestPath)
+		if err != nil {
+			fail(fmt.Errorf("publish: load manifest: %w", err))
+		}
+		mergeManifest(&req, loaded)
+	}
+	// -ostree-commit is the OSTREE shorthand; forces format+length.
+	if *ostreeCommit != "" {
+		if *sha256 != "" && *sha256 != *ostreeCommit {
+			fail(fmt.Errorf("publish: -sha256 and -ostree-commit disagree"))
+		}
+		req.SHA256 = *ostreeCommit
+		req.TargetFormat = "OSTREE"
+		req.Length = 0
+	} else if *sha256 != "" {
+		req.SHA256 = *sha256
+	}
+	// Each explicit flag wins over the manifest value when non-empty.
+	if *length != 0 {
+		req.Length = *length
+	}
+	if *format != "OSTREE" || req.TargetFormat == "" {
+		req.TargetFormat = *format
+	}
+	if *hardware != "" {
+		req.HardwareIDs = splitCSV(*hardware)
+	}
+	if *tags != "" {
+		req.Tags = splitCSV(*tags)
+	}
+	if *uri != "" {
+		req.URI = *uri
+	}
+	if *origURI != "" {
+		req.OrigURI = *origURI
+	}
+	if *imageFile != "" {
+		req.ImageFile = *imageFile
+	}
+	if *apps != "" {
+		req.ComposeApps = parseAppPairs(*apps)
+	}
+	if *lmpVer != "" {
+		req.LMPVer = *lmpVer
+	}
+	if *lmpManifestSHA != "" {
+		req.LMPManifestSHA = *lmpManifestSHA
+	}
+	if *metaSHA != "" {
+		req.MetaSubscriberOverridesSHA = *metaSHA
+	}
+	if *containersSHA != "" {
+		req.ContainersSHA = *containersSHA
 	}
 
-	req := api.PublishRequest{
-		Name:         name,
-		Version:      version,
-		SHA256:       *sha256,
-		Length:       *length,
-		HardwareIDs:  splitCSV(*hardware),
-		Tags:         splitCSV(*tags),
-		TargetFormat: *format,
-		URI:          *uri,
-		ComposeApps:  parseAppPairs(*apps),
+	if req.SHA256 == "" {
+		fail(fmt.Errorf("publish: -sha256 (or -ostree-commit, or manifest's sha256) is required"))
 	}
 	resp, err := c.PublishTarget(ctx, repoID, req)
 	if err != nil {
 		fail(err)
 	}
 	out.publishResult(resp)
+}
+
+// loadManifest reads a JSON build manifest into a PublishRequest. Any
+// fields a real Foundries CI emits land here; unknown fields are ignored.
+// Caller layers explicit CLI flags on top.
+func loadManifest(path string) (*api.PublishRequest, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m api.PublishRequest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// mergeManifest copies non-empty fields from src into dst. Used by publish
+// to seed the request from a manifest before the per-flag overlay.
+func mergeManifest(dst, src *api.PublishRequest) {
+	if src.SHA256 != "" {
+		dst.SHA256 = src.SHA256
+	}
+	if src.Length != 0 {
+		dst.Length = src.Length
+	}
+	if src.TargetFormat != "" {
+		dst.TargetFormat = src.TargetFormat
+	}
+	if len(src.HardwareIDs) > 0 {
+		dst.HardwareIDs = src.HardwareIDs
+	}
+	if len(src.Tags) > 0 {
+		dst.Tags = src.Tags
+	}
+	if src.URI != "" {
+		dst.URI = src.URI
+	}
+	if src.OrigURI != "" {
+		dst.OrigURI = src.OrigURI
+	}
+	if src.ImageFile != "" {
+		dst.ImageFile = src.ImageFile
+	}
+	if len(src.ComposeApps) > 0 {
+		dst.ComposeApps = src.ComposeApps
+	}
+	if src.LMPVer != "" {
+		dst.LMPVer = src.LMPVer
+	}
+	if src.LMPManifestSHA != "" {
+		dst.LMPManifestSHA = src.LMPManifestSHA
+	}
+	if src.MetaSubscriberOverridesSHA != "" {
+		dst.MetaSubscriberOverridesSHA = src.MetaSubscriberOverridesSHA
+	}
+	if src.ContainersSHA != "" {
+		dst.ContainersSHA = src.ContainersSHA
+	}
 }
 
 // splitCSV splits a comma-separated list, dropping empty entries.

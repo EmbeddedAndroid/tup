@@ -115,6 +115,39 @@ func TestPublishTarget(t *testing.T) {
 	}
 }
 
+// TestPublishTarget_SendsLmPFields confirms the new LmP fields land in
+// the JSON body that hits tufd. tup is a thin client — if it drops a
+// field on the way out, the wire artifact is missing it forever.
+func TestPublishTarget_SendsLmPFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got PublishRequest
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		if got.LMPVer != "98" || got.LMPManifestSHA != "aaa" ||
+			got.MetaSubscriberOverridesSHA != "bbb" || got.ContainersSHA != "ccc" {
+			t.Errorf("LmP fields missing in body: %+v", got)
+		}
+		if got.OrigURI != "https://api.foundries.io/x" || got.ImageFile != "lmp.wic.gz" {
+			t.Errorf("orig_uri/image_file missing: orig=%q file=%q", got.OrigURI, got.ImageFile)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(PublishResponse{
+			TargetKey: "lmp-98", TargetsVersion: 2, SnapshotVersion: 2, TimestampVersion: 2000,
+		})
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL).PublishTarget(context.Background(), "rid-1", PublishRequest{
+		Name: "lmp", Version: "98", SHA256: "deadbeef",
+		OrigURI: "https://api.foundries.io/x",
+		ImageFile: "lmp.wic.gz",
+		LMPVer: "98", LMPManifestSHA: "aaa",
+		MetaSubscriberOverridesSHA: "bbb", ContainersSHA: "ccc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPublishTarget_Conflict guards the duplicate-publish path: a 409 from
 // tufd must surface as an *Error so callers can branch on it.
 func TestPublishTarget_Conflict(t *testing.T) {
