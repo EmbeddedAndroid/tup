@@ -25,7 +25,8 @@ func New(baseURL string) *Client {
 	}
 }
 
-// Factory matches tufd's NamespaceListEntry.
+// Factory matches tufd's NamespaceListEntry (wire-compat name; the
+// public CLI subcommand is `namespace`).
 type Factory struct {
 	RepoID            string `json:"repo_id"`
 	Name              string `json:"name"`
@@ -52,7 +53,7 @@ func (c *Client) ListNamespaces(ctx context.Context) ([]Factory, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, statusErr("list factories", resp)
+		return nil, statusErr("list namespaces", resp)
 	}
 	var out struct {
 		Factories []Factory `json:"factories"`
@@ -71,7 +72,7 @@ func (c *Client) CreateNamespace(ctx context.Context, req CreateRequest) (*Creat
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return nil, statusErr("create factory", resp)
+		return nil, statusErr("create namespace", resp)
 	}
 	var out CreateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -123,7 +124,7 @@ func (c *Client) PublishTarget(ctx context.Context, repoID string, req PublishRe
 	return &out, nil
 }
 
-// FetchRoot returns the raw signed root role for a factory and the
+// FetchRoot returns the raw signed root role for a namespace and the
 // x-ats-role-checksum value the server advertises.
 func (c *Client) FetchRoot(ctx context.Context, repoID string) ([]byte, string, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/root.json", nil)

@@ -22,10 +22,10 @@ Usage:
   tup [flags] <command> [args...]
 
 Commands:
-  factory create <name>                 Create a new factory
-  factory list                          List all factories
-  factory show <repo-id>                Show the signed root role for a factory
-  publish <repo-id> <name> <version>    Publish a new target into a factory
+  namespace create <name>               Create a new namespace
+  namespace list                        List all namespaces
+  namespace show <repo-id>              Show the signed root role for a namespace
+  publish <repo-id> <name> <version>    Publish a new target into a namespace
   version                               Print version
   help                                  Show this help
 
@@ -44,9 +44,9 @@ publish flags:
   -app <name=uri[,name=uri...]> docker-compose apps for this target
 
 Examples:
-  tup factory create acme
-  tup -json factory list
-  tup -url https://tufd.internal:9001 factory show 0d9eaef2-1234-...
+  tup namespace create acme
+  tup -json namespace list
+  tup -url https://tufd.internal:9001 namespace show 0d9eaef2-1234-...
   tup publish demo lmp 42 -sha256 abc123... -hardware intel-corei7-64 -tags main
 `
 
@@ -76,8 +76,8 @@ func main() {
 		out.scalar("version", Version)
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stderr, help)
-	case "factory":
-		runFactory(ctx, client, args[1:], out)
+	case "namespace":
+		runNamespace(ctx, client, args[1:], out)
 	case "publish":
 		runPublish(ctx, client, args[1:], out)
 	default:
@@ -158,37 +158,37 @@ func parseAppPairs(s string) map[string]string {
 	return out
 }
 
-func runFactory(ctx context.Context, c *api.Client, args []string, out output) {
+func runNamespace(ctx context.Context, c *api.Client, args []string, out output) {
 	if len(args) == 0 {
-		fail(fmt.Errorf("factory needs a subcommand: create | list | show"))
+		fail(fmt.Errorf("namespace needs a subcommand: create | list | show"))
 	}
 	switch args[0] {
 	case "create":
 		if len(args) < 2 {
-			fail(fmt.Errorf("factory create needs a name"))
+			fail(fmt.Errorf("namespace create needs a name"))
 		}
 		resp, err := c.CreateNamespace(ctx, api.CreateRequest{Name: args[1]})
 		if err != nil {
 			fail(err)
 		}
-		out.factoryCreated(resp)
+		out.namespaceCreated(resp)
 	case "list":
 		facts, err := c.ListNamespaces(ctx)
 		if err != nil {
 			fail(err)
 		}
-		out.factories(facts)
+		out.namespaces(facts)
 	case "show":
 		if len(args) < 2 {
-			fail(fmt.Errorf("factory show needs a repo-id"))
+			fail(fmt.Errorf("namespace show needs a repo-id"))
 		}
 		body, checksum, err := c.FetchRoot(ctx, args[1])
 		if err != nil {
 			fail(err)
 		}
-		out.factoryRoot(args[1], checksum, body)
+		out.namespaceRoot(args[1], checksum, body)
 	default:
-		fail(fmt.Errorf("unknown factory subcommand: %s", args[0]))
+		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
 }
 
@@ -203,13 +203,13 @@ func (o output) scalar(key, val string) {
 	fmt.Println(val)
 }
 
-func (o output) factories(fs []api.Factory) {
+func (o output) namespaces(fs []api.Factory) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(fs)
 		return
 	}
 	if len(fs) == 0 {
-		fmt.Println("(no factories)")
+		fmt.Println("(no namespaces)")
 		return
 	}
 	for _, f := range fs {
@@ -221,12 +221,12 @@ func (o output) factories(fs []api.Factory) {
 	}
 }
 
-func (o output) factoryCreated(r *api.CreateResponse) {
+func (o output) namespaceCreated(r *api.CreateResponse) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(r)
 		return
 	}
-	fmt.Printf("created factory %q\n", r.Name)
+	fmt.Printf("created namespace %q\n", r.Name)
 	fmt.Printf("  repo_id:      %s\n", r.RepoID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
@@ -243,7 +243,7 @@ func (o output) publishResult(r *api.PublishResponse) {
 	fmt.Printf("  timestamp: v%d\n", r.TimestampVersion)
 }
 
-func (o output) factoryRoot(repoID, checksum string, body []byte) {
+func (o output) namespaceRoot(repoID, checksum string, body []byte) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"repo_id":  repoID,
@@ -252,7 +252,7 @@ func (o output) factoryRoot(repoID, checksum string, body []byte) {
 		})
 		return
 	}
-	fmt.Printf("factory %s\n  root checksum: %s\n  root size:     %d bytes\n\n",
+	fmt.Printf("namespace %s\n  root checksum: %s\n  root size:     %d bytes\n\n",
 		repoID, checksum, len(body))
 	fmt.Println(string(body))
 }
