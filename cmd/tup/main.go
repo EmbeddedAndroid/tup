@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,10 @@ publish flags:
                                 for OSTREE this is the commit hash)
   -ostree-commit <hex>          alias for -sha256; also forces -format OSTREE
                                 and -length 0
+  -ostree-repo <path>           resolve the commit from a local OSTree repo
+                                via 'ostree rev-parse'; sets -sha256
+                                automatically. Pair with -ostree-ref.
+  -ostree-ref <ref>             OSTree ref to resolve (default "main")
   -length <int>                 byte length; 0 for OSTREE targets
   -hardware <h1,h2,...>         comma-separated hardware ids
   -tags <t1,t2,...>             comma-separated tag list
@@ -139,6 +144,8 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	manifestPath := fs.String("manifest", "", "load a build manifest JSON (LmP fields)")
 	sha256 := fs.String("sha256", "", "sha256 hex of the target artifact")
 	ostreeCommit := fs.String("ostree-commit", "", "ostree commit hash (alias for -sha256, forces OSTREE format)")
+	ostreeRepo := fs.String("ostree-repo", "", "path to an OSTree repo to resolve the commit from")
+	ostreeRef := fs.String("ostree-ref", "main", "OSTree ref to resolve (used with -ostree-repo)")
 	length := fs.Int64("length", 0, "byte length; 0 for OSTREE")
 	hardware := fs.String("hardware", "", "comma-separated hardware ids")
 	tags := fs.String("tags", "", "comma-separated tags")
@@ -165,8 +172,21 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 		}
 		mergeManifest(&req, loaded)
 	}
-	// -ostree-commit is the OSTREE shorthand; forces format+length.
-	if *ostreeCommit != "" {
+	// -ostree-repo: derive the commit from a local OSTree repo via
+	// `ostree rev-parse <ref>`. Takes precedence over -sha256 /
+	// -ostree-commit if they're also set (the repo is the source of
+	// truth in real CI flows).
+	if *ostreeRepo != "" {
+		commit, err := ostreeRevParse(*ostreeRepo, *ostreeRef)
+		if err != nil {
+			fail(fmt.Errorf("publish: resolve ostree commit from %s ref %s: %w",
+				*ostreeRepo, *ostreeRef, err))
+		}
+		req.SHA256 = commit
+		req.TargetFormat = "OSTREE"
+		req.Length = 0
+	} else if *ostreeCommit != "" {
+		// -ostree-commit is the OSTREE shorthand; forces format+length.
 		if *sha256 != "" && *sha256 != *ostreeCommit {
 			fail(fmt.Errorf("publish: -sha256 and -ostree-commit disagree"))
 		}
@@ -222,6 +242,27 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 		fail(err)
 	}
 	out.publishResult(resp)
+}
+
+// ostreeRevParse shells to `ostree rev-parse <ref> --repo=<path>` and
+// returns the bare commit hash. Var so tests can override.
+var ostreeRevParse = func(repoPath, ref string) (string, error) {
+	cmd := exec.Command("ostree", "rev-parse", "--repo="+repoPath, ref)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ostree rev-parse: %w (out: %s)", err, strings.TrimSpace(string(out)))
+	}
+	hash := strings.TrimSpace(string(out))
+	// Sanity: ostree commits are 64-char lowercase hex sha256.
+	if len(hash) != 64 {
+		return "", fmt.Errorf("ostree rev-parse returned unexpected output %q (want 64-hex commit)", hash)
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fmt.Errorf("ostree rev-parse returned non-hex output %q", hash)
+		}
+	}
+	return hash, nil
 }
 
 // loadManifest reads a JSON build manifest into a PublishRequest. Any
