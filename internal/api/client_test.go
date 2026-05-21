@@ -199,6 +199,69 @@ func TestRotateRoot(t *testing.T) {
 	}
 }
 
+func TestStageRotation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user_repo/demo/root/stage" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var req StageRotationRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.NewPublicKeyPEM == "" {
+			t.Error("new_pubkey_pem empty")
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(StageRotationResponse{
+			StagingID:      "abc123",
+			NewRootVersion: 2,
+			NewRootKeyID:   "newkey",
+			PriorRootKeyID: "oldkey",
+			BytesToSign:    []byte(`{"_type":"Root","version":2}`),
+			RequiredKeyIDs: []string{"oldkey", "newkey"},
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).StageRotation(context.Background(), "demo", StageRotationRequest{
+		NewPublicKeyPEM: "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StagingID != "abc123" || got.NewRootVersion != 2 || len(got.RequiredKeyIDs) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestFinalizeRotation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user_repo/demo/root/finalize" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var req FinalizeRotationRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.StagingID == "" || len(req.Envelope) == 0 {
+			t.Error("staging_id or envelope missing")
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(RotateRootResponse{
+			NewRootVersion: 2, NewRootKeyID: "newkey",
+			PriorRootKeyID: "oldkey", PriorRootVersion: 1,
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL).FinalizeRotation(context.Background(), "demo", FinalizeRotationRequest{
+		StagingID: "abc123",
+		Envelope:  []byte(`{"signatures":[],"signed":"abc"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NewRootVersion != 2 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

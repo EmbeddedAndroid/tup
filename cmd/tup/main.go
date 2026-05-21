@@ -2,11 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,13 +30,19 @@ Usage:
   tup [flags] <command> [args...]
 
 Commands:
-  namespace create <name>               Create a new namespace
-  namespace list                        List all namespaces
-  namespace show <repo-id>              Show the signed root role for a namespace
-  namespace rotate <repo-id>            Rotate the root key (server-side dual-key)
-  publish <repo-id> <name> <version>    Publish a new target into a namespace
-  version                               Print version
-  help                                  Show this help
+  namespace create <name>                       Create a new namespace
+  namespace list                                List all namespaces
+  namespace show <repo-id>                      Show the signed root role for a namespace
+  namespace rotate <repo-id>                    Rotate the root key (server-side dual-key)
+  namespace stage-rotation <repo-id> --new-pubkey <file>
+                                                Start an offline rotation; downloads bytes-to-sign
+  sign-rotation --tosign <file> --old-key <pem> --new-key <pem> -o <file>
+                                                Locally sign a staged rotation envelope
+  namespace finalize-rotation <repo-id> --signed <file>
+                                                POST a customer-signed envelope to commit the rotation
+  publish <repo-id> <name> <version>            Publish a new target into a namespace
+  version                                       Print version
+  help                                          Show this help
 
 Global flags:
   -url <URL>                    tufd base URL (default $TUP_URL or http://localhost:9001)
@@ -93,6 +107,12 @@ func main() {
 		runNamespace(ctx, client, args[1:], out)
 	case "publish":
 		runPublish(ctx, client, args[1:], out)
+	case "sign-rotation":
+		// Top-level (not under `namespace`) because the operation is
+		// offline + local — it doesn't talk to tufd. The customer
+		// might run it on an air-gapped HSM host where -url isn't
+		// even meaningful.
+		runSignRotation(args[1:])
 	default:
 		fail(fmt.Errorf("unknown command: %s", args[0]))
 	}
@@ -317,9 +337,200 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		out.namespaceRoot(args[1], checksum, body)
 	case "rotate":
 		runNamespaceRotate(ctx, c, args[1:], out)
+	case "stage-rotation":
+		runStageRotation(ctx, c, args[1:], out)
+	case "finalize-rotation":
+		runFinalizeRotation(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runStageRotation: POST /root/stage with the customer's new pubkey.
+// Writes the bytes-to-sign to a file the customer can hand to their
+// offline signing setup, plus prints the staging_id needed at
+// finalize time.
+func runStageRotation(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("stage-rotation needs a repo-id"))
+	}
+	repoID := args[0]
+	fs := flag.NewFlagSet("stage-rotation", flag.ExitOnError)
+	newPubkey := fs.String("new-pubkey", "", "PEM-encoded SPKI public key file (required)")
+	outDir := fs.String("out-dir", ".", "directory to write the bytes-to-sign file into")
+	keytype := fs.String("keytype", "ed25519", "ed25519 | rsa-4096")
+	scheme := fs.String("scheme", "", "signature scheme (defaults to keytype's standard)")
+	if err := fs.Parse(args[1:]); err != nil {
+		fail(err)
+	}
+	if *newPubkey == "" {
+		fail(fmt.Errorf("stage-rotation: --new-pubkey <file> is required"))
+	}
+	pubBytes, err := os.ReadFile(*newPubkey)
+	if err != nil {
+		fail(fmt.Errorf("stage-rotation: read pubkey: %w", err))
+	}
+	resp, err := c.StageRotation(ctx, repoID, api.StageRotationRequest{
+		NewPublicKeyPEM: string(pubBytes),
+		NewKeyType:      *keytype,
+		NewScheme:       *scheme,
+	})
+	if err != nil {
+		fail(err)
+	}
+	tosignPath := filepath.Join(*outDir, "tosign-"+resp.StagingID+".json")
+	if err := os.WriteFile(tosignPath, resp.BytesToSign, 0o644); err != nil {
+		fail(fmt.Errorf("stage-rotation: write tosign file: %w", err))
+	}
+	out.stageRotationResult(resp, tosignPath)
+}
+
+// runFinalizeRotation: POST /root/finalize with a customer-signed
+// envelope file. The envelope file MUST be the {signatures, signed}
+// JSON the offline signer produced (or what `sign-rotation` wrote).
+func runFinalizeRotation(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("finalize-rotation needs a repo-id"))
+	}
+	repoID := args[0]
+	fs := flag.NewFlagSet("finalize-rotation", flag.ExitOnError)
+	signed := fs.String("signed", "", "path to the signed envelope JSON (required)")
+	stagingID := fs.String("staging-id", "", "staging_id from `stage-rotation` (required)")
+	if err := fs.Parse(args[1:]); err != nil {
+		fail(err)
+	}
+	if *signed == "" || *stagingID == "" {
+		fail(fmt.Errorf("finalize-rotation: --signed <file> and --staging-id <id> required"))
+	}
+	envBytes, err := os.ReadFile(*signed)
+	if err != nil {
+		fail(fmt.Errorf("finalize-rotation: read envelope: %w", err))
+	}
+	resp, err := c.FinalizeRotation(ctx, repoID, api.FinalizeRotationRequest{
+		StagingID: *stagingID,
+		Envelope:  envBytes,
+	})
+	if err != nil {
+		fail(err)
+	}
+	out.rotateResult(resp)
+}
+
+// runSignRotation reads a tosign file + two private key files (the
+// old root key and the new root key the customer just minted), signs
+// the tosign bytes with both, and writes the resulting envelope to
+// -o. Supports ed25519 and RSA private keys in PEM PKCS#8 form (the
+// shape `openssl genpkey -algorithm ed25519` produces).
+func runSignRotation(args []string) {
+	fs := flag.NewFlagSet("sign-rotation", flag.ExitOnError)
+	tosignPath := fs.String("tosign", "", "tosign file from `stage-rotation` (required)")
+	oldKeyPath := fs.String("old-key", "", "PEM PKCS#8 private key for the CURRENT root key (required)")
+	newKeyPath := fs.String("new-key", "", "PEM PKCS#8 private key for the NEW root key (required)")
+	outPath := fs.String("o", "signed-rotation.json", "envelope output file")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if *tosignPath == "" || *oldKeyPath == "" || *newKeyPath == "" {
+		fail(fmt.Errorf("sign-rotation: --tosign, --old-key, --new-key all required"))
+	}
+	tosign, err := os.ReadFile(*tosignPath)
+	if err != nil {
+		fail(fmt.Errorf("sign-rotation: read tosign: %w", err))
+	}
+	oldSig, err := signCanonicalWithPEM(tosign, *oldKeyPath)
+	if err != nil {
+		fail(fmt.Errorf("sign-rotation: old key: %w", err))
+	}
+	newSig, err := signCanonicalWithPEM(tosign, *newKeyPath)
+	if err != nil {
+		fail(fmt.Errorf("sign-rotation: new key: %w", err))
+	}
+	envelope := map[string]any{
+		"signatures": []map[string]string{
+			{"keyid": oldSig.KeyID, "sig": oldSig.Sig},
+			{"keyid": newSig.KeyID, "sig": newSig.Sig},
+		},
+		"signed": json.RawMessage(tosign),
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		fail(err)
+	}
+	if err := os.WriteFile(*outPath, body, 0o600); err != nil {
+		fail(fmt.Errorf("sign-rotation: write envelope: %w", err))
+	}
+	fmt.Printf("signed envelope written to %s\n", *outPath)
+	fmt.Printf("  old keyid:  %s\n", oldSig.KeyID)
+	fmt.Printf("  new keyid:  %s\n", newSig.KeyID)
+}
+
+// pemSignature is the {keyid, sig} pair the offline signer produces.
+type pemSignature struct {
+	KeyID string
+	Sig   string
+}
+
+// signCanonicalWithPEM reads a PEM PKCS#8 private key, computes the
+// matching keyid (sha256 of SPKI DER), and signs `canonical` with the
+// appropriate algorithm. Supports ed25519 + RSA; matches the
+// algorithms tufd's tuflib.SignBytes uses.
+func signCanonicalWithPEM(canonical []byte, keyPath string) (*pemSignature, error) {
+	pemBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in %s", keyPath)
+	}
+	privAny, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKCS#8: %w", err)
+	}
+
+	// Derive the keyid from the SPKI DER of the matching public key.
+	var pubKey crypto.PublicKey
+	switch k := privAny.(type) {
+	case ed25519.PrivateKey:
+		pubKey = k.Public()
+	case *rsa.PrivateKey:
+		pubKey = &k.PublicKey
+	default:
+		return nil, fmt.Errorf("unsupported private key type %T", privAny)
+	}
+	spkiDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return nil, err
+	}
+	kidSum := sha256Sum(spkiDER)
+	kid := hexEncode(kidSum[:])
+
+	// Sign.
+	var rawSig []byte
+	switch k := privAny.(type) {
+	case ed25519.PrivateKey:
+		rawSig = ed25519.Sign(k, canonical)
+	case *rsa.PrivateKey:
+		digest := sha256Sum(canonical)
+		rawSig, err = rsa.SignPSS(rand.Reader, k, crypto.SHA256, digest[:],
+			&rsa.PSSOptions{SaltLength: 32, Hash: crypto.SHA256})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &pemSignature{KeyID: kid, Sig: hexEncode(rawSig)}, nil
+}
+
+func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }
+
+func hexEncode(b []byte) string {
+	const hex = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, x := range b {
+		out[i*2] = hex[x>>4]
+		out[i*2+1] = hex[x&0x0f]
+	}
+	return string(out)
 }
 
 func runNamespaceRotate(ctx context.Context, c *api.Client, args []string, out output) {
@@ -378,6 +589,35 @@ func (o output) namespaceCreated(r *api.CreateResponse) {
 	fmt.Printf("  repo_id:      %s\n", r.RepoID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
+}
+
+func (o output) stageRotationResult(r *api.StageRotationResponse, tosignPath string) {
+	if o.json {
+		out := map[string]any{
+			"staging_id":       r.StagingID,
+			"new_root_version": r.NewRootVersion,
+			"new_root_keyid":   r.NewRootKeyID,
+			"prior_root_keyid": r.PriorRootKeyID,
+			"required_keyids":  r.RequiredKeyIDs,
+			"expires_at":       r.ExpiresAt,
+			"tosign_file":      tosignPath,
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(out)
+		return
+	}
+	fmt.Printf("staged rotation: v%d (prior keyid %s)\n",
+		r.NewRootVersion, r.PriorRootKeyID)
+	fmt.Printf("  new keyid:     %s\n", r.NewRootKeyID)
+	fmt.Printf("  staging id:    %s\n", r.StagingID)
+	fmt.Printf("  expires:       %s\n", r.ExpiresAt)
+	fmt.Printf("  signers req:   %d keys must sign the new root\n", len(r.RequiredKeyIDs))
+	for _, kid := range r.RequiredKeyIDs {
+		fmt.Printf("    - %s\n", kid)
+	}
+	fmt.Printf("  bytes to sign: %s (%d bytes)\n", tosignPath, len(r.BytesToSign))
+	fmt.Printf("\nNext:\n")
+	fmt.Printf("  tup sign-rotation --tosign %s --old-key OLD.pem --new-key NEW.pem -o signed.json\n", tosignPath)
+	fmt.Printf("  tup namespace finalize-rotation <rid> --staging-id %s --signed signed.json\n", r.StagingID)
 }
 
 func (o output) rotateResult(r *api.RotateRootResponse) {

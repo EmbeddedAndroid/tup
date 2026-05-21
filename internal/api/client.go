@@ -124,6 +124,76 @@ type RotateRootRequest struct {
 	KeyType string `json:"key_type,omitempty"`
 }
 
+// StageRotationRequest matches tufd's offline-stage body.
+type StageRotationRequest struct {
+	NewPublicKeyPEM string `json:"new_pubkey_pem"`
+	NewKeyType      string `json:"new_keytype,omitempty"`
+	NewScheme       string `json:"new_scheme,omitempty"`
+}
+
+// StageRotationResponse matches tufd's offline-stage response. Bytes to
+// sign come back as raw JSON bytes (base64-encoded over the wire by
+// the JSON encoder — Go's json.Unmarshal of []byte handles it).
+type StageRotationResponse struct {
+	StagingID      string   `json:"staging_id"`
+	NewRootVersion int      `json:"new_root_version"`
+	NewRootKeyID   string   `json:"new_root_keyid"`
+	PriorRootKeyID string   `json:"prior_root_keyid"`
+	BytesToSign    []byte   `json:"bytes_to_sign"`
+	RequiredKeyIDs []string `json:"required_keyids"`
+	ExpiresAt      string   `json:"expires_at"`
+}
+
+// StageRotation hits POST /root/stage; the returned BytesToSign is
+// exactly what the customer must sign with both old and new private
+// keys, byte-for-byte, no re-canonicalization.
+func (c *Client) StageRotation(ctx context.Context, repoID string, req StageRotationRequest) (*StageRotationResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/root/stage", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("stage rotation", resp)
+	}
+	var out StageRotationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode stage: %w", err)
+	}
+	return &out, nil
+}
+
+// FinalizeRotationRequest matches tufd's offline-finalize body. The
+// envelope is the raw bytes of the {signatures, signed} JSON the
+// customer produced offline.
+type FinalizeRotationRequest struct {
+	StagingID string `json:"staging_id"`
+	Envelope  []byte `json:"envelope"`
+}
+
+// FinalizeRotation POSTs the offline-signed envelope and returns the
+// finalized rotation state. Reuses RotateRootResponse since the
+// success shape is identical to the dual-key flow.
+func (c *Client) FinalizeRotation(ctx context.Context, repoID string, req FinalizeRotationRequest) (*RotateRootResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/root/finalize", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("finalize rotation", resp)
+	}
+	var out RotateRootResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode finalize: %w", err)
+	}
+	return &out, nil
+}
+
 // RotateRoot generates a new root key for repoID, co-signs a new Root
 // role at v+1 with both old and new keys, and returns the version chain.
 // A 409 means the namespace has no root yet (only possible on a broken
