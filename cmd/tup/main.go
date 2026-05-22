@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/foundriesio/tup/internal/api"
+	"github.com/foundriesio/tup/internal/tufvalidate"
 )
 
 var Version = "dev"
@@ -35,6 +36,7 @@ Commands:
   namespace list                                List all namespaces
   namespace show <repo-id>                      Show the signed root role for a namespace
   namespace rotate <repo-id>                    Rotate the root key (server-side dual-key)
+  namespace validate <repo-id>                  Walk the TUF chain end-to-end + verify all signatures
   namespace create-with-key --name <n> --root-pubkey <file>
                                                 Bootstrap with a customer-held offline root key (cold-key)
   namespace finalize-create --staging-id <id> --signed <file>
@@ -406,6 +408,8 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		out.namespaceRoot(args[1], checksum, body)
 	case "rotate":
 		runNamespaceRotate(ctx, c, args[1:], out)
+	case "validate":
+		runNamespaceValidate(args[1:], out, c)
 	case "stage-rotation":
 		runStageRotation(ctx, c, args[1:], out)
 	case "finalize-rotation":
@@ -705,6 +709,23 @@ func hexEncode(b []byte) string {
 	return string(out)
 }
 
+// runNamespaceValidate walks the TUF chain end-to-end against tufd and
+// prints a per-role verification report. Uses internal/tufvalidate so
+// the logic is exercise-able from Go tests too.
+func runNamespaceValidate(args []string, out output, c *api.Client) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("namespace validate needs a repo-id"))
+	}
+	repoID := args[0]
+	r, err := tufvalidate.Validate(c.BaseURL, repoID)
+	if r != nil {
+		out.validateResult(r)
+	}
+	if err != nil {
+		fail(err)
+	}
+}
+
 func runNamespaceRotate(ctx context.Context, c *api.Client, args []string, out output) {
 	if len(args) == 0 {
 		fail(fmt.Errorf("namespace rotate needs a repo-id"))
@@ -820,6 +841,51 @@ func (o output) stageRotationResult(r *api.StageRotationResponse, tosignPath str
 	fmt.Printf("\nNext:\n")
 	fmt.Printf("  tup sign-rotation --tosign %s --old-key OLD.pem --new-key NEW.pem -o signed.json\n", tosignPath)
 	fmt.Printf("  tup namespace finalize-rotation <rid> --staging-id %s --signed signed.json\n", r.StagingID)
+}
+
+func (o output) validateResult(r *tufvalidate.Result) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(r)
+		return
+	}
+	fmt.Printf("namespace %s — TUF chain validation\n", r.RepoID)
+	fmt.Printf("\nroot chain (latest: v%d)\n", r.LatestRoot)
+	for _, step := range r.RootChain {
+		marker := "  ✓"
+		if step.Status != "ok" {
+			marker = "  ✗"
+		}
+		fmt.Printf("%s v%-3d sigs=%d keyid=%s  %s\n",
+			marker, step.Version, step.Signatures,
+			truncKeyID(step.KeyID), step.Status)
+	}
+	fmt.Printf("\nrole verification (against latest root)\n")
+	for _, rv := range []struct{ name string; v RoleVerification }{
+		{"timestamp", roleConv(r.Timestamp)},
+		{"snapshot ", roleConv(r.Snapshot)},
+		{"targets  ", roleConv(r.Targets)},
+	} {
+		marker := "  ✓"
+		if rv.v.Status != "ok" {
+			marker = "  ✗"
+		}
+		fmt.Printf("%s %s v%-4d %s\n", marker, rv.name, rv.v.Version, rv.v.Status)
+	}
+	fmt.Printf("\ntargets in latest manifest: %d\n", r.TargetCount)
+}
+
+// RoleVerification is re-exported here so the format functions can
+// reference it without re-importing tufvalidate (which is already in
+// scope for the caller).
+type RoleVerification = tufvalidate.RoleVerification
+
+func roleConv(rv tufvalidate.RoleVerification) RoleVerification { return rv }
+
+func truncKeyID(k string) string {
+	if len(k) > 16 {
+		return k[:8] + "…" + k[len(k)-4:]
+	}
+	return k
 }
 
 func (o output) rotateResult(r *api.RotateRootResponse) {
