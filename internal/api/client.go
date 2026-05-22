@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -312,6 +313,33 @@ func (c *Client) GetCA(ctx context.Context, repoID string) ([]byte, error) {
 		return nil, fmt.Errorf("api: read CA: %w", err)
 	}
 	return body, nil
+}
+
+// Backup streams a gzipped tar of the tufd data dir. Returns the
+// body reader (caller must Close), the server-suggested filename
+// (parsed from Content-Disposition), and any error. Stream is
+// unbuffered — caller writes it to disk directly.
+func (c *Client) Backup(ctx context.Context) (io.ReadCloser, string, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/_backup", nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return nil, "", fmt.Errorf("api: backup status %d", resp.StatusCode)
+	}
+	suggested := ""
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		const prefix = `filename="`
+		if i := strings.Index(cd, prefix); i >= 0 {
+			rest := cd[i+len(prefix):]
+			if j := strings.Index(rest, `"`); j >= 0 {
+				suggested = rest[:j]
+			}
+		}
+	}
+	return resp.Body, suggested, nil
 }
 
 // RotateRoot generates a new root key for repoID, co-signs a new Root

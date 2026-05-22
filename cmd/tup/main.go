@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/foundriesio/tup/internal/api"
+	"github.com/foundriesio/tup/internal/backup"
 	"github.com/foundriesio/tup/internal/tufvalidate"
 )
 
@@ -422,9 +424,80 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runRegisterDevice(ctx, c, args[1:], out)
 	case "get-ca":
 		runGetCA(ctx, c, args[1:], out)
+	case "backup":
+		runBackup(ctx, c, args[1:], out)
+	case "restore":
+		runRestore(args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runBackup streams tufd's GET /api/v1/_backup tarball into --out.
+// Whole-stack snapshot: keystore (encrypted .enc + .salt), all
+// namespaces' tuf.db, all devca dirs. Operator MUST keep the
+// keystore passphrase separately — without it the .enc files are
+// useless on restore.
+func runBackup(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("backup", flag.ExitOnError)
+	outPath := fs.String("out", "", "write tarball here (default: tufd-backup-<ts>.tgz)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	r, suggested, err := c.Backup(ctx)
+	if err != nil {
+		fail(err)
+	}
+	defer r.Close()
+	path := *outPath
+	if path == "" {
+		if suggested != "" {
+			path = suggested
+		} else {
+			path = "tufd-backup.tgz"
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		fail(err)
+	}
+	defer f.Close()
+	n, err := io.Copy(f, r)
+	if err != nil {
+		fail(err)
+	}
+	out.backupResult(path, n)
+}
+
+// runRestore extracts a backup tarball into a local data dir. LOCAL
+// op — does NOT talk to tufd. Operator runs it against a stopped
+// tufd's data dir, then starts tufd back up.
+func runRestore(args []string, out output) {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "tufd data dir to restore into (REQUIRED — tufd must be stopped)")
+	allowNonEmpty := fs.Bool("allow-non-empty", false, "allow restore into a non-empty dir (existing files overwritten)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *dataDir == "" {
+		fail(fmt.Errorf("restore <tarball.tgz> --data-dir <path> [--allow-non-empty]"))
+	}
+	tarPath := fs.Args()[0]
+	if !*allowNonEmpty {
+		entries, _ := os.ReadDir(*dataDir)
+		if len(entries) > 0 {
+			fail(fmt.Errorf("data dir %s is non-empty; pass --allow-non-empty to overwrite", *dataDir))
+		}
+	}
+	f, err := os.Open(tarPath)
+	if err != nil {
+		fail(err)
+	}
+	defer f.Close()
+	if err := backup.Read(f, *dataDir); err != nil {
+		fail(err)
+	}
+	out.restoreResult(tarPath, *dataDir)
 }
 
 // runRegisterDevice: POSTs to /api/v1/user_repo/<rid>/devices and
@@ -983,6 +1056,31 @@ func (o output) registerDeviceResult(r *api.RegisterDeviceResponse, outDir strin
 	fmt.Println("  client_certificate_path = \"/var/sota/cert.pem\"")
 	fmt.Println("  pkey_path               = \"/var/sota/key.pem\"")
 	fmt.Println("  ca_path                 = \"/var/sota/ca.pem\"")
+}
+
+func (o output) backupResult(path string, bytes int64) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"path": path, "bytes": bytes,
+		})
+		return
+	}
+	fmt.Printf("backup written to %s (%d bytes)\n", path, bytes)
+	fmt.Println()
+	fmt.Println("IMPORTANT: keep the tufd keystore passphrase separately.")
+	fmt.Println("Without it the .enc files in the tarball are useless.")
+}
+
+func (o output) restoreResult(tarPath, dataDir string) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
+			"tarball": tarPath, "data_dir": dataDir,
+		})
+		return
+	}
+	fmt.Printf("restored %s into %s\n", tarPath, dataDir)
+	fmt.Println("Start tufd against this data dir with the original")
+	fmt.Println("keystore passphrase (TUFD_KEYSTORE_PASSPHRASE).")
 }
 
 func (o output) unpublishResult(key string, r *api.PublishResponse) {
