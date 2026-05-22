@@ -402,6 +402,64 @@ func (c *Client) ListPins(ctx context.Context, repoID, deviceID string) ([]Devic
 	return body.Pins, nil
 }
 
+// ConfigFile mirrors tufd's configstore.File (subset).
+type ConfigFile struct {
+	Name        string   `json:"name"`
+	Value       string   `json:"value"`
+	OnChanged   []string `json:"on_changed,omitempty"`
+	Unencrypted bool     `json:"unencrypted,omitempty"`
+	UpdatedAt   int64    `json:"updated_at,omitempty"`
+	UpdatedBy   string   `json:"updated_by,omitempty"`
+}
+
+// ConfigSet uploads a single config file to the namespace.
+func (c *Client) ConfigSet(ctx context.Context, repoID, name string, value []byte, unencrypted bool, onChanged []string, by string) error {
+	body, _ := json.Marshal(map[string]any{
+		"value":       string(value),
+		"on_changed":  onChanged,
+		"unencrypted": unencrypted,
+		"updated_by":  by,
+	})
+	resp, err := c.do(ctx, http.MethodPut,
+		"/api/v1/user_repo/"+repoID+"/config/"+name, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("config set", resp)
+	}
+	return nil
+}
+
+func (c *Client) ConfigList(ctx context.Context, repoID string) ([]ConfigFile, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/config", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("config list", resp)
+	}
+	var body struct {
+		Files []ConfigFile `json:"files"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Files, nil
+}
+
+func (c *Client) ConfigDelete(ctx context.Context, repoID, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/api/v1/user_repo/"+repoID+"/config/"+name, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("config delete", resp)
+	}
+	return nil
+}
+
 // Backup streams a gzipped tar of the tufd data dir. Returns the
 // body reader (caller must Close), the server-suggested filename
 // (parsed from Content-Disposition), and any error. Stream is

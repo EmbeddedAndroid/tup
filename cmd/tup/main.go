@@ -434,9 +434,90 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runUnpinDevice(ctx, c, args[1:], out)
 	case "list-pins":
 		runListPins(ctx, c, args[1:], out)
+	case "config":
+		runConfigSubcommand(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runConfigSubcommand dispatches `tup namespace config <set|list|rm>`.
+// Wraps tufd's fioconfig admin endpoints. Files stored plaintext on
+// the server; encrypted per-device-pubkey at GET time by tufd.
+func runConfigSubcommand(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("config needs a subcommand: set | list | rm"))
+	}
+	switch args[0] {
+	case "set":
+		runConfigSet(ctx, c, args[1:], out)
+	case "list":
+		runConfigList(ctx, c, args[1:], out)
+	case "rm":
+		runConfigRm(ctx, c, args[1:], out)
+	default:
+		fail(fmt.Errorf("unknown config subcommand: %s", args[0]))
+	}
+}
+
+func runConfigSet(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("config-set", flag.ExitOnError)
+	name := fs.String("name", "", "file name on device (required)")
+	path := fs.String("from", "", "read file content from this path (default: stdin)")
+	unenc := fs.Bool("unencrypted", false, "store + serve plaintext (no per-device encryption)")
+	on := fs.String("on-changed", "", "comma-separated on-changed handler paths")
+	by := fs.String("by", "", "actor recording the upload")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" {
+		fail(fmt.Errorf("config set <repo-id> --name <file> [--from <path>] [--unencrypted] [--on-changed <cmd,...>] [--by <actor>]"))
+	}
+	repoID := fs.Args()[0]
+	var content []byte
+	var err error
+	if *path == "" || *path == "-" {
+		content, err = io.ReadAll(os.Stdin)
+	} else {
+		content, err = os.ReadFile(*path)
+	}
+	if err != nil {
+		fail(err)
+	}
+	onChanged := []string{}
+	if *on != "" {
+		onChanged = strings.Split(*on, ",")
+	}
+	if err := c.ConfigSet(ctx, repoID, *name, content, *unenc, onChanged, *by); err != nil {
+		fail(err)
+	}
+	out.configSetResult(repoID, *name, len(content), *unenc)
+}
+
+func runConfigList(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 1 {
+		fail(fmt.Errorf("config list <repo-id>"))
+	}
+	files, err := c.ConfigList(ctx, args[0])
+	if err != nil {
+		fail(err)
+	}
+	out.configListResult(args[0], files)
+}
+
+func runConfigRm(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("config-rm", flag.ExitOnError)
+	name := fs.String("name", "", "file name to remove (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" {
+		fail(fmt.Errorf("config rm <repo-id> --name <file>"))
+	}
+	if err := c.ConfigDelete(ctx, fs.Args()[0], *name); err != nil {
+		fail(err)
+	}
+	fmt.Printf("removed %s\n", *name)
 }
 
 // runPinDevice posts a pin to tufd. Repeated pins for the same
@@ -1130,6 +1211,42 @@ func (o output) backupResult(path string, bytes int64) {
 	fmt.Println()
 	fmt.Println("IMPORTANT: keep the tufd keystore passphrase separately.")
 	fmt.Println("Without it the .enc files in the tarball are useless.")
+}
+
+func (o output) configSetResult(rid, name string, size int, unenc bool) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"repo_id": rid, "name": name, "size": size, "unencrypted": unenc,
+		})
+		return
+	}
+	enc := "encrypted per-device on fetch"
+	if unenc {
+		enc = "plaintext (operator opt-out)"
+	}
+	fmt.Printf("config set %q in %s (%d bytes, %s)\n", name, rid, size, enc)
+}
+
+func (o output) configListResult(rid string, files []api.ConfigFile) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(files)
+		return
+	}
+	if len(files) == 0 {
+		fmt.Printf("no config files in %s\n", rid)
+		return
+	}
+	fmt.Printf("%d config file(s) in %s:\n", len(files), rid)
+	for _, f := range files {
+		mode := ""
+		if f.Unencrypted {
+			mode = " (unencrypted)"
+		}
+		fmt.Printf("  %-24s %d bytes%s\n", f.Name, len(f.Value), mode)
+		if len(f.OnChanged) > 0 {
+			fmt.Printf("    on-changed: %s\n", strings.Join(f.OnChanged, ", "))
+		}
+	}
 }
 
 func (o output) pinResult(rid, deviceID, target string) {
