@@ -402,6 +402,71 @@ func (c *Client) ListPins(ctx context.Context, repoID, deviceID string) ([]Devic
 	return body.Pins, nil
 }
 
+// App mirrors tufd's appstore.App (subset used by the CLI).
+type App struct {
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	SHA256     string `json:"sha256"`
+	Size       int64  `json:"size"`
+	UploadedAt int64  `json:"uploaded_at,omitempty"`
+	UploadedBy string `json:"uploaded_by,omitempty"`
+}
+
+// AppPush streams the bundle tarball into the namespace's app store.
+func (c *Client) AppPush(ctx context.Context, repoID, name, version, by string, r io.Reader) (*App, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/compose-apps/"+name+"/"+version, r)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/gzip")
+	if by != "" {
+		req.Header.Set("X-Updated-By", by)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("app push", resp)
+	}
+	var out App
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) AppList(ctx context.Context, repoID string) ([]App, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/compose-apps", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("app list", resp)
+	}
+	var body struct {
+		Apps []App `json:"apps"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Apps, nil
+}
+
+func (c *Client) AppDelete(ctx context.Context, repoID, name, version string) error {
+	resp, err := c.do(ctx, http.MethodDelete,
+		"/api/v1/user_repo/"+repoID+"/compose-apps/"+name+"/"+version, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("app delete", resp)
+	}
+	return nil
+}
+
 // ConfigFile mirrors tufd's configstore.File (subset).
 type ConfigFile struct {
 	Name        string   `json:"name"`

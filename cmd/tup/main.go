@@ -436,9 +436,87 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runListPins(ctx, c, args[1:], out)
 	case "config":
 		runConfigSubcommand(ctx, c, args[1:], out)
+	case "app":
+		runAppSubcommand(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runAppSubcommand dispatches `tup namespace app <push|list|rm>`.
+// Wraps tufd's compose-app bundle store: operator uploads a tarball
+// by (name, version); target publishes reference apps via the
+// existing `-app <name>=<uri>` flag.
+func runAppSubcommand(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("app needs a subcommand: push | list | rm"))
+	}
+	switch args[0] {
+	case "push":
+		runAppPush(ctx, c, args[1:], out)
+	case "list":
+		runAppList(ctx, c, args[1:], out)
+	case "rm":
+		runAppRm(ctx, c, args[1:], out)
+	default:
+		fail(fmt.Errorf("unknown app subcommand: %s", args[0]))
+	}
+}
+
+func runAppPush(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("app-push", flag.ExitOnError)
+	name := fs.String("name", "", "compose-app name (required)")
+	ver := fs.String("version", "", "compose-app version (required)")
+	bundle := fs.String("from", "", "path to bundle tarball (default: stdin)")
+	by := fs.String("by", "", "actor recording the upload")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" || *ver == "" {
+		fail(fmt.Errorf("app push <repo-id> --name X --version V [--from <tarball>] [--by <actor>]"))
+	}
+	repoID := fs.Args()[0]
+	var r io.Reader = os.Stdin
+	if *bundle != "" && *bundle != "-" {
+		f, err := os.Open(*bundle)
+		if err != nil {
+			fail(err)
+		}
+		defer f.Close()
+		r = f
+	}
+	app, err := c.AppPush(ctx, repoID, *name, *ver, *by, r)
+	if err != nil {
+		fail(err)
+	}
+	out.appPushResult(repoID, app)
+}
+
+func runAppList(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 1 {
+		fail(fmt.Errorf("app list <repo-id>"))
+	}
+	apps, err := c.AppList(ctx, args[0])
+	if err != nil {
+		fail(err)
+	}
+	out.appListResult(args[0], apps)
+}
+
+func runAppRm(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("app-rm", flag.ExitOnError)
+	name := fs.String("name", "", "compose-app name (required)")
+	ver := fs.String("version", "", "compose-app version (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" || *ver == "" {
+		fail(fmt.Errorf("app rm <repo-id> --name X --version V"))
+	}
+	if err := c.AppDelete(ctx, fs.Args()[0], *name, *ver); err != nil {
+		fail(err)
+	}
+	fmt.Printf("removed app %s:%s\n", *name, *ver)
 }
 
 // runConfigSubcommand dispatches `tup namespace config <set|list|rm>`.
@@ -1211,6 +1289,35 @@ func (o output) backupResult(path string, bytes int64) {
 	fmt.Println()
 	fmt.Println("IMPORTANT: keep the tufd keystore passphrase separately.")
 	fmt.Println("Without it the .enc files in the tarball are useless.")
+}
+
+func (o output) appPushResult(rid string, app *api.App) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(app)
+		return
+	}
+	fmt.Printf("pushed app %s:%s in %s (%d bytes, sha256 %s)\n",
+		app.Name, app.Version, rid, app.Size, app.SHA256[:16])
+	fmt.Println("reference from a target publish via:")
+	fmt.Printf("  tup -url <tufd> publish %s <name> <ver> -ostree-commit ... \\\n", rid)
+	fmt.Printf("    -hardware intel-corei7-64 -tags main \\\n")
+	fmt.Printf("    -app %s=https://<gw>:9200/compose-apps/%s/%s\n",
+		app.Name, app.Name, app.Version)
+}
+
+func (o output) appListResult(rid string, apps []api.App) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(apps)
+		return
+	}
+	if len(apps) == 0 {
+		fmt.Printf("no apps in %s\n", rid)
+		return
+	}
+	fmt.Printf("%d app(s) in %s:\n", len(apps), rid)
+	for _, a := range apps {
+		fmt.Printf("  %-20s %-10s %s   %d bytes\n", a.Name, a.Version, a.SHA256[:16], a.Size)
+	}
 }
 
 func (o output) configSetResult(rid, name string, size int, unenc bool) {
