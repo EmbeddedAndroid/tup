@@ -428,9 +428,70 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runBackup(ctx, c, args[1:], out)
 	case "restore":
 		runRestore(args[1:], out)
+	case "pin-device":
+		runPinDevice(ctx, c, args[1:], out)
+	case "unpin-device":
+		runUnpinDevice(ctx, c, args[1:], out)
+	case "list-pins":
+		runListPins(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runPinDevice posts a pin to tufd. Repeated pins for the same
+// (device, target) are no-ops on the server.
+func runPinDevice(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("pin-device", flag.ExitOnError)
+	devID := fs.String("device-id", "", "device-id to pin (required)")
+	target := fs.String("target", "", "target key (e.g. lmp-2); required")
+	by := fs.String("by", "", "actor recording the pin (optional)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *devID == "" || *target == "" {
+		fail(fmt.Errorf("pin-device <repo-id> --device-id <id> --target <target-key> [--by <actor>]"))
+	}
+	repoID := fs.Args()[0]
+	if err := c.PinDevice(ctx, repoID, *devID, *target, *by); err != nil {
+		fail(err)
+	}
+	out.pinResult(repoID, *devID, *target)
+}
+
+func runUnpinDevice(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("unpin-device", flag.ExitOnError)
+	devID := fs.String("device-id", "", "device-id to unpin (required)")
+	target := fs.String("target", "", "remove only this target (default: remove all pins for device)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *devID == "" {
+		fail(fmt.Errorf("unpin-device <repo-id> --device-id <id> [--target <target-key>]"))
+	}
+	repoID := fs.Args()[0]
+	n, err := c.UnpinDevice(ctx, repoID, *devID, *target)
+	if err != nil {
+		fail(err)
+	}
+	out.unpinResult(repoID, *devID, *target, n)
+}
+
+func runListPins(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("list-pins", flag.ExitOnError)
+	devID := fs.String("device-id", "", "restrict to this device (default: all pins in namespace)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 {
+		fail(fmt.Errorf("list-pins <repo-id> [--device-id <id>]"))
+	}
+	repoID := fs.Args()[0]
+	pins, err := c.ListPins(ctx, repoID, *devID)
+	if err != nil {
+		fail(err)
+	}
+	out.pinsList(repoID, *devID, pins)
 }
 
 // runBackup streams tufd's GET /api/v1/_backup tarball into --out.
@@ -1069,6 +1130,52 @@ func (o output) backupResult(path string, bytes int64) {
 	fmt.Println()
 	fmt.Println("IMPORTANT: keep the tufd keystore passphrase separately.")
 	fmt.Println("Without it the .enc files in the tarball are useless.")
+}
+
+func (o output) pinResult(rid, deviceID, target string) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
+			"repo_id": rid, "device_id": deviceID, "target": target,
+		})
+		return
+	}
+	fmt.Printf("pinned %s -> %s in %s\n", deviceID, target, rid)
+	fmt.Println("Device will see ONLY this target on its next director poll.")
+}
+
+func (o output) unpinResult(rid, deviceID, target string, removed int) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"repo_id": rid, "device_id": deviceID, "target": target, "removed": removed,
+		})
+		return
+	}
+	if target == "" {
+		fmt.Printf("unpinned %s in %s (%d row(s) removed)\n", deviceID, rid, removed)
+	} else {
+		fmt.Printf("unpinned %s -> %s in %s (%d row(s) removed)\n", deviceID, target, rid, removed)
+	}
+}
+
+func (o output) pinsList(rid, deviceID string, pins []api.DevicePin) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"repo_id": rid, "device_id": deviceID, "pins": pins,
+		})
+		return
+	}
+	if len(pins) == 0 {
+		fmt.Printf("no pins in %s", rid)
+		if deviceID != "" {
+			fmt.Printf(" for device %s", deviceID)
+		}
+		fmt.Println()
+		return
+	}
+	fmt.Printf("%d pin(s) in %s:\n", len(pins), rid)
+	for _, p := range pins {
+		fmt.Printf("  %s  ->  %s   (by %s)\n", p.DeviceID, p.TargetKey, p.PinnedBy)
+	}
 }
 
 func (o output) restoreResult(tarPath, dataDir string) {

@@ -315,6 +315,93 @@ func (c *Client) GetCA(ctx context.Context, repoID string) ([]byte, error) {
 	return body, nil
 }
 
+// DevicePin mirrors tufd's repostore.DevicePin shape (subset used
+// by the CLI).
+type DevicePin struct {
+	DeviceID  string `json:"device_id"`
+	TargetKey string `json:"target_key"`
+	PinnedAt  int64  `json:"pinned_at"`
+	PinnedBy  string `json:"pinned_by"`
+}
+
+// PinDevice records a (device, target) pin in the namespace.
+// Idempotent — re-pinning the same pair is a no-op server-side.
+func (c *Client) PinDevice(ctx context.Context, repoID, deviceID, targetKey, pinnedBy string) error {
+	body, _ := json.Marshal(map[string]string{
+		"target_key": targetKey, "pinned_by": pinnedBy,
+	})
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/devices/"+deviceID+"/pins", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return statusErr("pin device", resp)
+	}
+	return nil
+}
+
+// UnpinDevice removes pins for a device. When targetKey is empty,
+// removes ALL pins for the device. Returns the count removed.
+func (c *Client) UnpinDevice(ctx context.Context, repoID, deviceID, targetKey string) (int, error) {
+	path := "/api/v1/user_repo/" + repoID + "/devices/" + deviceID + "/pins"
+	if targetKey != "" {
+		path = path + "/" + targetKey
+	}
+	resp, err := c.do(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, statusErr("unpin device", resp)
+	}
+	var body struct {
+		Removed int `json:"removed"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Removed, nil
+}
+
+// ListPins returns pins in the namespace (all devices, or filtered
+// when deviceID is set).
+func (c *Client) ListPins(ctx context.Context, repoID, deviceID string) ([]DevicePin, error) {
+	var path string
+	if deviceID == "" {
+		path = "/api/v1/user_repo/" + repoID + "/pins"
+	} else {
+		path = "/api/v1/user_repo/" + repoID + "/devices/" + deviceID + "/pins"
+	}
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("list pins", resp)
+	}
+	if deviceID != "" {
+		var body struct {
+			TargetKeys []string `json:"target_keys"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		out := make([]DevicePin, 0, len(body.TargetKeys))
+		for _, k := range body.TargetKeys {
+			out = append(out, DevicePin{DeviceID: deviceID, TargetKey: k})
+		}
+		return out, nil
+	}
+	var body struct {
+		Pins []DevicePin `json:"pins"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Pins, nil
+}
+
 // Backup streams a gzipped tar of the tufd data dir. Returns the
 // body reader (caller must Close), the server-suggested filename
 // (parsed from Content-Disposition), and any error. Stream is
