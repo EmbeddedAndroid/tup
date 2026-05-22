@@ -438,9 +438,115 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runConfigSubcommand(ctx, c, args[1:], out)
 	case "app":
 		runAppSubcommand(ctx, c, args[1:], out)
+	case "wave":
+		runWaveSubcommand(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runWaveSubcommand dispatches `tup namespace wave <create|list|delete|add|remove>`.
+// Waves are per-device targets filtering on the image-repo path so
+// aktualizr-lite (which never hits the director) honors per-device
+// rollouts the same way aktualizr-primary already does via pins.
+func runWaveSubcommand(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("wave needs a subcommand: create | list | delete | add | remove"))
+	}
+	switch args[0] {
+	case "create":
+		runWaveCreate(ctx, c, args[1:], out)
+	case "list":
+		runWaveList(ctx, c, args[1:], out)
+	case "delete":
+		runWaveDelete(ctx, c, args[1:], out)
+	case "add":
+		runWaveAdd(ctx, c, args[1:], out)
+	case "remove":
+		runWaveRemove(ctx, c, args[1:], out)
+	default:
+		fail(fmt.Errorf("unknown wave subcommand: %s", args[0]))
+	}
+}
+
+func runWaveCreate(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("wave-create", flag.ExitOnError)
+	name := fs.String("name", "", "wave name (required)")
+	tgts := fs.String("targets", "", "comma-separated target_keys")
+	by := fs.String("by", "", "creator actor")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" {
+		fail(fmt.Errorf("wave create <repo-id> --name X [--targets k1,k2] [--by actor]"))
+	}
+	keys := []string{}
+	if *tgts != "" {
+		keys = strings.Split(*tgts, ",")
+	}
+	if err := c.WaveCreate(ctx, fs.Args()[0], *name, keys, *by); err != nil {
+		fail(err)
+	}
+	fmt.Printf("wave %q created in %s with %d target(s)\n", *name, fs.Args()[0], len(keys))
+}
+
+func runWaveList(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 1 {
+		fail(fmt.Errorf("wave list <repo-id>"))
+	}
+	waves, err := c.WaveList(ctx, args[0])
+	if err != nil {
+		fail(err)
+	}
+	out.waveListResult(args[0], waves)
+}
+
+func runWaveDelete(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("wave-delete", flag.ExitOnError)
+	name := fs.String("name", "", "wave name (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" {
+		fail(fmt.Errorf("wave delete <repo-id> --name X"))
+	}
+	if err := c.WaveDelete(ctx, fs.Args()[0], *name); err != nil {
+		fail(err)
+	}
+	fmt.Printf("wave %q deleted\n", *name)
+}
+
+func runWaveAdd(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("wave-add", flag.ExitOnError)
+	name := fs.String("name", "", "wave name (required)")
+	device := fs.String("device-id", "", "device to add (required)")
+	by := fs.String("by", "", "actor")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" || *device == "" {
+		fail(fmt.Errorf("wave add <repo-id> --name X --device-id D [--by actor]"))
+	}
+	if err := c.WaveAddMember(ctx, fs.Args()[0], *name, *device, *by); err != nil {
+		fail(err)
+	}
+	fmt.Printf("added %s to wave %q\n", *device, *name)
+}
+
+func runWaveRemove(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("wave-remove", flag.ExitOnError)
+	name := fs.String("name", "", "wave name (required)")
+	device := fs.String("device-id", "", "device to remove (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *name == "" || *device == "" {
+		fail(fmt.Errorf("wave remove <repo-id> --name X --device-id D"))
+	}
+	if err := c.WaveRemoveMember(ctx, fs.Args()[0], *name, *device); err != nil {
+		fail(err)
+	}
+	fmt.Printf("removed %s from wave %q\n", *device, *name)
 }
 
 // runAppSubcommand dispatches `tup namespace app <push|list|rm>`.
@@ -1289,6 +1395,27 @@ func (o output) backupResult(path string, bytes int64) {
 	fmt.Println()
 	fmt.Println("IMPORTANT: keep the tufd keystore passphrase separately.")
 	fmt.Println("Without it the .enc files in the tarball are useless.")
+}
+
+func (o output) waveListResult(rid string, waves []api.Wave) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(waves)
+		return
+	}
+	if len(waves) == 0 {
+		fmt.Printf("no waves in %s\n", rid)
+		return
+	}
+	fmt.Printf("%d wave(s) in %s:\n", len(waves), rid)
+	for _, w := range waves {
+		fmt.Printf("  %s\n", w.Name)
+		if len(w.TargetKeys) > 0 {
+			fmt.Printf("    targets: %s\n", strings.Join(w.TargetKeys, ", "))
+		}
+		if len(w.Members) > 0 {
+			fmt.Printf("    members: %s\n", strings.Join(w.Members, ", "))
+		}
+	}
 }
 
 func (o output) appPushResult(rid string, app *api.App) {

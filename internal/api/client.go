@@ -402,6 +402,85 @@ func (c *Client) ListPins(ctx context.Context, repoID, deviceID string) ([]Devic
 	return body.Pins, nil
 }
 
+// Wave mirrors tufd's repostore.Wave.
+type Wave struct {
+	Name       string   `json:"name"`
+	TargetKeys []string `json:"target_keys"`
+	CreatedAt  int64    `json:"created_at,omitempty"`
+	CreatedBy  string   `json:"created_by,omitempty"`
+	Members    []string `json:"members,omitempty"`
+}
+
+func (c *Client) WaveCreate(ctx context.Context, repoID, name string, targetKeys []string, by string) error {
+	body, _ := json.Marshal(map[string]any{
+		"name": name, "target_keys": targetKeys, "created_by": by,
+	})
+	resp, err := c.do(ctx, http.MethodPost, "/api/v1/user_repo/"+repoID+"/waves", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return statusErr("wave create", resp)
+	}
+	return nil
+}
+
+func (c *Client) WaveList(ctx context.Context, repoID string) ([]Wave, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/waves", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("wave list", resp)
+	}
+	var body struct {
+		Waves []Wave `json:"waves"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Waves, nil
+}
+
+func (c *Client) WaveDelete(ctx context.Context, repoID, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/api/v1/user_repo/"+repoID+"/waves/"+name, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("wave delete", resp)
+	}
+	return nil
+}
+
+func (c *Client) WaveAddMember(ctx context.Context, repoID, name, deviceID, by string) error {
+	body, _ := json.Marshal(map[string]string{"device_id": deviceID, "added_by": by})
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/waves/"+name+"/members", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return statusErr("wave add member", resp)
+	}
+	return nil
+}
+
+func (c *Client) WaveRemoveMember(ctx context.Context, repoID, name, deviceID string) error {
+	resp, err := c.do(ctx, http.MethodDelete,
+		"/api/v1/user_repo/"+repoID+"/waves/"+name+"/members/"+deviceID, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("wave remove member", resp)
+	}
+	return nil
+}
+
 // App mirrors tufd's appstore.App (subset used by the CLI).
 type App struct {
 	Name       string `json:"name"`
