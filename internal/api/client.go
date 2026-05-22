@@ -266,6 +266,54 @@ func (c *Client) FinalizeRotation(ctx context.Context, repoID string, req Finali
 	return &out, nil
 }
 
+// RegisterDeviceResponse mirrors tufd's device-register response.
+type RegisterDeviceResponse struct {
+	DeviceID string `json:"device_id"`
+	RepoID   string `json:"repo_id"`
+	CertPEM  string `json:"cert_pem"`
+	KeyPEM   string `json:"key_pem"`
+	CAPEM    string `json:"ca_pem"`
+}
+
+// RegisterDevice mints a client cert for deviceID under repoID.
+// Returns cert + private key (PKCS#8 ed25519) + the namespace CA cert.
+func (c *Client) RegisterDevice(ctx context.Context, repoID, deviceID string) (*RegisterDeviceResponse, error) {
+	body, _ := json.Marshal(map[string]string{"device_id": deviceID})
+	resp, err := c.do(ctx, http.MethodPost,
+		"/api/v1/user_repo/"+repoID+"/devices", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil, statusErr("register device", resp)
+	}
+	var out RegisterDeviceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode register-device: %w", err)
+	}
+	return &out, nil
+}
+
+// GetCA returns the namespace's device-CA cert PEM. devgw uses this
+// to verify incoming device client certs over mTLS.
+func (c *Client) GetCA(ctx context.Context, repoID string) ([]byte, error) {
+	resp, err := c.do(ctx, http.MethodGet,
+		"/api/v1/user_repo/"+repoID+"/ca.crt", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("get CA", resp)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("api: read CA: %w", err)
+	}
+	return body, nil
+}
+
 // RotateRoot generates a new root key for repoID, co-signs a new Root
 // role at v+1 with both old and new keys, and returns the version chain.
 // A 409 means the namespace has no root yet (only possible on a broken

@@ -418,9 +418,77 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runCreateWithKey(ctx, c, args[1:], out)
 	case "finalize-create":
 		runFinalizeCreate(ctx, c, args[1:], out)
+	case "register-device":
+		runRegisterDevice(ctx, c, args[1:], out)
+	case "get-ca":
+		runGetCA(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runRegisterDevice: POSTs to /api/v1/user_repo/<rid>/devices and
+// writes cert.pem + key.pem + ca.pem into --out-dir for the operator
+// to install on the device. Idempotent at the cert-issue level (each
+// call mints a fresh keypair; the prior cert isn't revoked).
+func runRegisterDevice(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("register-device", flag.ExitOnError)
+	devID := fs.String("device-id", "", "device-id (becomes the cert CN, required)")
+	outDir := fs.String("out-dir", ".", "directory to write cert.pem + key.pem + ca.pem")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *devID == "" {
+		fail(fmt.Errorf("register-device <repo-id> --device-id <id> [--out-dir <dir>]"))
+	}
+	repoID := fs.Args()[0]
+	resp, err := c.RegisterDevice(ctx, repoID, *devID)
+	if err != nil {
+		fail(err)
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fail(err)
+	}
+	for name, content := range map[string]string{
+		"cert.pem": resp.CertPEM,
+		"key.pem":  resp.KeyPEM,
+		"ca.pem":   resp.CAPEM,
+	} {
+		path := filepath.Join(*outDir, name)
+		mode := os.FileMode(0o644)
+		if name == "key.pem" {
+			mode = 0o600
+		}
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			fail(err)
+		}
+	}
+	out.registerDeviceResult(resp, *outDir)
+}
+
+// runGetCA writes the namespace CA cert to --out (or stdout).
+func runGetCA(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("get-ca", flag.ExitOnError)
+	outPath := fs.String("out", "", "path to write ca.pem (empty = stdout)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 {
+		fail(fmt.Errorf("get-ca <repo-id>"))
+	}
+	repoID := fs.Args()[0]
+	pem, err := c.GetCA(ctx, repoID)
+	if err != nil {
+		fail(err)
+	}
+	if *outPath == "" {
+		os.Stdout.Write(pem)
+		return
+	}
+	if err := os.WriteFile(*outPath, pem, 0o644); err != nil {
+		fail(err)
+	}
+	fmt.Printf("wrote ca cert to %s (%d bytes)\n", *outPath, len(pem))
 }
 
 // runCreateWithKey: POST /api/v1/user_repo/_bootstrap-stage with the
@@ -896,6 +964,25 @@ func (o output) rotateResult(r *api.RotateRootResponse) {
 	fmt.Printf("rotated: v%d -> v%d\n", r.PriorRootVersion, r.NewRootVersion)
 	fmt.Printf("  new keyid:   %s\n", r.NewRootKeyID)
 	fmt.Printf("  prior keyid: %s\n", r.PriorRootKeyID)
+}
+
+func (o output) registerDeviceResult(r *api.RegisterDeviceResponse, outDir string) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(r)
+		return
+	}
+	fmt.Printf("registered device %q in namespace %s\n", r.DeviceID, r.RepoID)
+	fmt.Printf("  cert.pem   %s/cert.pem\n", outDir)
+	fmt.Printf("  key.pem    %s/key.pem  (0600)\n", outDir)
+	fmt.Printf("  ca.pem     %s/ca.pem\n", outDir)
+	fmt.Println()
+	fmt.Println("Install on the device:")
+	fmt.Println("  scp cert.pem key.pem ca.pem fio@<device>:/var/sota/")
+	fmt.Println("Then update /var/sota/sota.toml:")
+	fmt.Println("  [tls]")
+	fmt.Println("  client_certificate_path = \"/var/sota/cert.pem\"")
+	fmt.Println("  pkey_path               = \"/var/sota/key.pem\"")
+	fmt.Println("  ca_path                 = \"/var/sota/ca.pem\"")
 }
 
 func (o output) unpublishResult(key string, r *api.PublishResponse) {
