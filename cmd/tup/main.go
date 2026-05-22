@@ -48,6 +48,7 @@ Commands:
   namespace finalize-rotation <repo-id> --signed <file>
                                                 POST a customer-signed envelope to commit the rotation
   publish <repo-id> <name> <version>            Publish a new target into a namespace
+  unpublish <repo-id> <name> <version>          Remove a target (bumps targets/snapshot/timestamp)
   version                                       Print version
   help                                          Show this help
 
@@ -118,6 +119,8 @@ func main() {
 		runNamespace(ctx, client, args[1:], out)
 	case "publish":
 		runPublish(ctx, client, args[1:], out)
+	case "unpublish":
+		runUnpublish(ctx, client, args[1:], out)
 	case "sign-rotation":
 		// Top-level (not under `namespace`) because the operation is
 		// offline + local — it doesn't talk to tufd. The customer
@@ -322,6 +325,20 @@ func mergeManifest(dst, src *api.PublishRequest) {
 	if src.ContainersSHA != "" {
 		dst.ContainersSHA = src.ContainersSHA
 	}
+}
+
+// runUnpublish: DELETE /api/v1/user_repo/<rid>/targets/<name>-<version>
+func runUnpublish(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 3 {
+		fail(fmt.Errorf("unpublish needs: <repo-id> <name> <version>"))
+	}
+	repoID, name, version := args[0], args[1], args[2]
+	key := name + "-" + version
+	resp, err := c.UnpublishTarget(ctx, repoID, key)
+	if err != nil {
+		fail(err)
+	}
+	out.unpublishResult(key, resp)
 }
 
 // splitCSV splits a comma-separated list, dropping empty entries.
@@ -813,6 +830,17 @@ func (o output) rotateResult(r *api.RotateRootResponse) {
 	fmt.Printf("rotated: v%d -> v%d\n", r.PriorRootVersion, r.NewRootVersion)
 	fmt.Printf("  new keyid:   %s\n", r.NewRootKeyID)
 	fmt.Printf("  prior keyid: %s\n", r.PriorRootKeyID)
+}
+
+func (o output) unpublishResult(key string, r *api.PublishResponse) {
+	if o.json {
+		_ = json.NewEncoder(os.Stdout).Encode(r)
+		return
+	}
+	fmt.Printf("unpublished %s\n", key)
+	fmt.Printf("  targets:   v%d\n", r.TargetsVersion)
+	fmt.Printf("  snapshot:  v%d\n", r.SnapshotVersion)
+	fmt.Printf("  timestamp: v%d\n", r.TimestampVersion)
 }
 
 func (o output) publishResult(r *api.PublishResponse) {

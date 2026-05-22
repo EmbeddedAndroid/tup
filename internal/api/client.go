@@ -288,6 +288,26 @@ func (c *Client) RotateRoot(ctx context.Context, repoID string, req RotateRootRe
 	return &out, nil
 }
 
+// UnpublishTarget removes a target entry by its name-version key (e.g.
+// "lmp-42") and returns the bumped role versions. 404 means the key
+// wasn't in the current Targets payload.
+func (c *Client) UnpublishTarget(ctx context.Context, repoID, key string) (*PublishResponse, error) {
+	resp, err := c.do(ctx, http.MethodDelete,
+		"/api/v1/user_repo/"+repoID+"/targets/"+key, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("unpublish target", resp)
+	}
+	var out PublishResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: decode unpublish: %w", err)
+	}
+	return &out, nil
+}
+
 // PublishTarget posts a new target entry and returns the resulting role
 // versions. A 409 surfaces as an *Error with Status=409.
 func (c *Client) PublishTarget(ctx context.Context, repoID string, req PublishRequest) (*PublishResponse, error) {
