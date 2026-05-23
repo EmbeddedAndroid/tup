@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/EmbeddedAndroid/tup/internal/api"
@@ -156,5 +157,135 @@ func TestMergeManifest_EmptyFieldsDoNotOverwrite(t *testing.T) {
 	}
 	if dst.SHA256 != "x" {
 		t.Fatalf("SHA256 should have been merged in: %q", dst.SHA256)
+	}
+}
+
+// makeYoctoLayout mocks a Yocto bitbake output tree at root for
+// machine m with refs (each becomes a file under ostree_repo/refs/heads).
+// manifests are bare image-name strings; each gets `-${m}.manifest`.
+func makeYoctoLayout(t *testing.T, root, m string, refs, manifests []string) {
+	t.Helper()
+	deploy := filepath.Join(root, "tmp", "deploy", "images", m)
+	if err := os.MkdirAll(filepath.Join(deploy, "ostree_repo", "refs", "heads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range refs {
+		p := filepath.Join(deploy, "ostree_repo", "refs", "heads", r)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("commit-hash-placeholder"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mf := range manifests {
+		p := filepath.Join(deploy, mf+"-"+m+".manifest")
+		if err := os.WriteFile(p, []byte("pkg1\npkg2\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDiscoverYoctoBuild_SingleMachine(t *testing.T) {
+	root := t.TempDir()
+	makeYoctoLayout(t, root, "intel-corei7-64", []string{"lmp"}, []string{"lmp-factory-image"})
+	info, err := discoverYoctoBuild(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Machine != "intel-corei7-64" {
+		t.Errorf("Machine = %q", info.Machine)
+	}
+	if info.BranchName != "lmp" {
+		t.Errorf("BranchName = %q, want lmp", info.BranchName)
+	}
+	if info.ImageName != "lmp-factory-image" {
+		t.Errorf("ImageName = %q", info.ImageName)
+	}
+	if !strings.HasSuffix(info.OstreeRepoPath, "intel-corei7-64/ostree_repo") {
+		t.Errorf("OstreeRepoPath = %q", info.OstreeRepoPath)
+	}
+}
+
+func TestDiscoverYoctoBuild_MultipleMachinesRequireHint(t *testing.T) {
+	root := t.TempDir()
+	makeYoctoLayout(t, root, "intel-corei7-64", []string{"lmp"}, []string{"lmp-factory-image"})
+	makeYoctoLayout(t, root, "raspberrypi4-64", []string{"lmp"}, []string{"lmp-factory-image"})
+	if _, err := discoverYoctoBuild(root, ""); err == nil {
+		t.Fatal("multiple machines without --machine should fail")
+	}
+	info, err := discoverYoctoBuild(root, "raspberrypi4-64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Machine != "raspberrypi4-64" {
+		t.Errorf("Machine = %q", info.Machine)
+	}
+	if _, err := discoverYoctoBuild(root, "unknown-machine"); err == nil {
+		t.Fatal("unknown machine hint should fail")
+	}
+}
+
+func TestDiscoverYoctoBuild_PrefersLmpRef(t *testing.T) {
+	root := t.TempDir()
+	makeYoctoLayout(t, root, "qemuarm64", []string{"main", "lmp", "experimental"}, []string{"lmp-factory-image"})
+	info, err := discoverYoctoBuild(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.BranchName != "lmp" {
+		t.Errorf("BranchName = %q, want lmp preferred", info.BranchName)
+	}
+}
+
+func TestDiscoverYoctoBuild_MissingOstreeRepo(t *testing.T) {
+	root := t.TempDir()
+	deploy := filepath.Join(root, "tmp", "deploy", "images", "foo")
+	if err := os.MkdirAll(deploy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := discoverYoctoBuild(root, ""); err == nil {
+		t.Fatal("missing ostree_repo should fail")
+	}
+}
+
+func TestDiscoverYoctoBuild_NotAYoctoTree(t *testing.T) {
+	root := t.TempDir()
+	if _, err := discoverYoctoBuild(root, ""); err == nil {
+		t.Fatal("plain dir should fail with 'not a Yocto build dir'")
+	} else if !strings.Contains(err.Error(), "not a Yocto build dir") {
+		t.Errorf("err = %v, want 'not a Yocto build dir'", err)
+	}
+}
+
+func TestDiscoverImageName_FallbackWithoutManifest(t *testing.T) {
+	root := t.TempDir()
+	makeYoctoLayout(t, root, "qemuarm64", []string{"lmp"}, nil) // no manifests
+	info, err := discoverYoctoBuild(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ImageName != "lmp-factory-image" {
+		t.Errorf("ImageName fallback = %q", info.ImageName)
+	}
+}
+
+func TestDiscoverOstreeBranch_NestedRef(t *testing.T) {
+	// Some Yocto configs put refs under refs/heads/<distro>/<machine>;
+	// discoverOstreeBranch should report the slash-joined relative path.
+	repo := t.TempDir()
+	nested := filepath.Join(repo, "refs", "heads", "lmp-os", "intel-corei7-64")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nested, []byte("commit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := discoverOstreeBranch(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "lmp-os/intel-corei7-64" {
+		t.Errorf("branch = %q, want lmp-os/intel-corei7-64", got)
 	}
 }

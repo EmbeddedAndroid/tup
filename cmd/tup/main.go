@@ -56,6 +56,9 @@ Commands:
                                                 POST a customer-signed envelope to commit the rotation
   publish <project-id> <name> <version>         Publish a new target into a project
   unpublish <project-id> <name> <version>       Remove a target (bumps targets/snapshot/timestamp)
+  yocto-publish <build-dir>                     One-shot: push ostree + publish target from a
+                                                Yocto/LmP build directory. Reads TUP_URL,
+                                                TUP_ADMIN_TOKEN, TUP_PROJECT from env.
   version                                       Print version
   help                                          Show this help
 
@@ -133,6 +136,8 @@ func main() {
 		runOstreeSubcommand(ctx, client, args[1:], out)
 	case "unpublish":
 		runUnpublish(ctx, client, args[1:], out)
+	case "yocto-publish":
+		runYoctoPublish(ctx, client, args[1:], out)
 	case "sign-rotation":
 		// Top-level (not under `namespace`) because the operation is
 		// offline + local — it doesn't talk to tufd. The customer
@@ -549,6 +554,212 @@ func runOstreePush(ctx context.Context, c *api.Client, args []string, out output
 	fmt.Fprintf(os.Stderr, "\nostree push %s done in %s:\n", repoID, dt.Truncate(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  %d objects (uploaded %d / skipped %d / errors %d, %.1f MB)\n",
 		stats.Total, stats.Uploaded, stats.Skipped, stats.Errors, mb)
+}
+
+// yoctoBuildInfo is what discoverYoctoBuild returns after walking a
+// Yocto/LmP build directory.
+type yoctoBuildInfo struct {
+	BuildDir       string
+	Machine        string
+	OstreeRepoPath string
+	BranchName     string
+	ImageName      string
+}
+
+// discoverYoctoBuild walks a Yocto build dir and returns the pieces
+// tup needs to publish a target. machineHint, if non-empty, picks one
+// when tmp/deploy/images/ has multiple machines; otherwise a single
+// machine dir is auto-selected.
+func discoverYoctoBuild(buildDir, machineHint string) (*yoctoBuildInfo, error) {
+	deploy := filepath.Join(buildDir, "tmp", "deploy", "images")
+	entries, err := os.ReadDir(deploy)
+	if err != nil {
+		return nil, fmt.Errorf("not a Yocto build dir (missing %s): %w", deploy, err)
+	}
+	var machines []string
+	for _, e := range entries {
+		if e.IsDir() {
+			machines = append(machines, e.Name())
+		}
+	}
+	if len(machines) == 0 {
+		return nil, fmt.Errorf("no machine subdirs in %s", deploy)
+	}
+	var machine string
+	switch {
+	case machineHint != "":
+		for _, m := range machines {
+			if m == machineHint {
+				machine = m
+				break
+			}
+		}
+		if machine == "" {
+			return nil, fmt.Errorf("--machine %q not in %v", machineHint, machines)
+		}
+	case len(machines) == 1:
+		machine = machines[0]
+	default:
+		return nil, fmt.Errorf("multiple machines (%v); pass --machine", machines)
+	}
+	machineDir := filepath.Join(deploy, machine)
+	ostreeRepo := filepath.Join(machineDir, "ostree_repo")
+	if st, err := os.Stat(ostreeRepo); err != nil || !st.IsDir() {
+		return nil, fmt.Errorf("no ostree_repo at %s", ostreeRepo)
+	}
+	branch, err := discoverOstreeBranch(ostreeRepo)
+	if err != nil {
+		return nil, err
+	}
+	return &yoctoBuildInfo{
+		BuildDir:       buildDir,
+		Machine:        machine,
+		OstreeRepoPath: ostreeRepo,
+		BranchName:     branch,
+		ImageName:      discoverImageName(machineDir, machine),
+	}, nil
+}
+
+// discoverOstreeBranch finds the ostree ref under refs/heads/. LmP
+// builds typically have a single ref like "lmp"; if there are several
+// we prefer "lmp" then "main" then the first alphabetically.
+func discoverOstreeBranch(repoPath string) (string, error) {
+	refsDir := filepath.Join(repoPath, "refs", "heads")
+	var refs []string
+	err := filepath.WalkDir(refsDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(refsDir, p)
+		refs = append(refs, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("walk %s: %w", refsDir, err)
+	}
+	if len(refs) == 0 {
+		return "", fmt.Errorf("no refs in %s — has the ostree commit been written yet?", refsDir)
+	}
+	for _, pref := range []string{"lmp", "main"} {
+		for _, r := range refs {
+			if r == pref {
+				return r, nil
+			}
+		}
+	}
+	return refs[0], nil
+}
+
+// discoverImageName looks for a *.manifest in the machine dir (Yocto
+// writes one per built image). Falls back to a sensible default if no
+// manifest is present.
+func discoverImageName(machineDir, machine string) string {
+	entries, err := os.ReadDir(machineDir)
+	if err != nil {
+		return "lmp-factory-image"
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasSuffix(n, ".manifest") {
+			continue
+		}
+		base := strings.TrimSuffix(n, ".manifest")
+		base = strings.TrimSuffix(base, "-"+machine)
+		if base != "" {
+			return base
+		}
+	}
+	return "lmp-factory-image"
+}
+
+// runYoctoPublish is the one-shot publish command for Yocto build
+// agents. Reads TUP_URL / TUP_ADMIN_TOKEN / TUP_PROJECT from env and
+// auto-discovers everything else from the bitbake output tree.
+func runYoctoPublish(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("yocto-publish", flag.ExitOnError)
+	machine := fs.String("machine", "", "MACHINE override (auto-detected if only one machine in tmp/deploy/images/)")
+	imageName := fs.String("name", "", "target name (default: image manifest filename)")
+	version := fs.String("version", "", "target version (default: unix timestamp)")
+	tagsArg := fs.String("tags", "devel", "comma-separated tags")
+	hwid := fs.String("hwid", "", "hardware id (default: MACHINE)")
+	branch := fs.String("branch", "", "ostree ref to publish (default: auto-detect)")
+	conc := fs.Int("c", 32, "concurrent ostree uploads")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) != 1 {
+		fail(fmt.Errorf("usage: tup yocto-publish [flags] <build-dir>"))
+	}
+	buildDir := fs.Args()[0]
+
+	project := envOr("TUP_PROJECT", "")
+	if project == "" {
+		fail(fmt.Errorf("TUP_PROJECT not set — the agent env must specify which project to publish into"))
+	}
+	token := envOr("TUP_ADMIN_TOKEN", "")
+	if token == "" {
+		fail(fmt.Errorf("TUP_ADMIN_TOKEN not set — required to authenticate ostree push and target publish"))
+	}
+
+	info, err := discoverYoctoBuild(buildDir, *machine)
+	if err != nil {
+		fail(fmt.Errorf("scan build dir: %w", err))
+	}
+	if *imageName == "" {
+		*imageName = info.ImageName
+	}
+	if *hwid == "" {
+		*hwid = info.Machine
+	}
+	if *branch == "" {
+		*branch = info.BranchName
+	}
+	if *version == "" {
+		*version = fmt.Sprintf("%d", time.Now().Unix())
+	}
+
+	fmt.Fprintf(os.Stderr, "▶ yocto-publish\n")
+	fmt.Fprintf(os.Stderr, "  build dir : %s\n", info.BuildDir)
+	fmt.Fprintf(os.Stderr, "  machine   : %s\n", info.Machine)
+	fmt.Fprintf(os.Stderr, "  ostree    : %s (ref=%s)\n", info.OstreeRepoPath, *branch)
+	fmt.Fprintf(os.Stderr, "  target    : %s/%s tags=%s hwid=%s\n", *imageName, *version, *tagsArg, *hwid)
+
+	// 1. push ostree objects
+	start := time.Now()
+	stats, err := c.OstreePushRepo(ctx, project, token, info.OstreeRepoPath, *branch, *conc, func(s api.OstreePushStats) {
+		if (s.Uploaded+s.Skipped)%200 == 0 {
+			fmt.Fprintf(os.Stderr, "  progress: %d/%d (uploaded=%d skipped=%d errors=%d)\r",
+				s.Uploaded+s.Skipped, s.Total, s.Uploaded, s.Skipped, s.Errors)
+		}
+	})
+	if err != nil {
+		fail(fmt.Errorf("ostree push: %w", err))
+	}
+	fmt.Fprintf(os.Stderr, "\n  ostree: %d objects (uploaded %d / skipped %d, %.1f MB) in %s\n",
+		stats.Total, stats.Uploaded, stats.Skipped, float64(stats.Bytes)/1024/1024,
+		time.Since(start).Truncate(time.Millisecond))
+
+	// 2. resolve commit hash for the ref we just pushed
+	commit, err := ostreeRevParse(info.OstreeRepoPath, *branch)
+	if err != nil {
+		fail(fmt.Errorf("resolve %s in %s: %w", *branch, info.OstreeRepoPath, err))
+	}
+
+	// 3. publish target
+	req := api.PublishRequest{
+		Name:         *imageName,
+		Version:      *version,
+		TargetFormat: "OSTREE",
+		SHA256:       commit,
+		Length:       0,
+		HardwareIDs:  []string{*hwid},
+		Tags:         splitCSV(*tagsArg),
+	}
+	resp, err := c.PublishTarget(ctx, project, req)
+	if err != nil {
+		fail(fmt.Errorf("publish target: %w", err))
+	}
+	out.publishResult(resp)
 }
 
 // runImportBuild orchestrates pushing a complete build (ostree repo +
