@@ -24,9 +24,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/foundriesio/tup/internal/api"
-	"github.com/foundriesio/tup/internal/backup"
-	"github.com/foundriesio/tup/internal/tufvalidate"
+	"github.com/EmbeddedAndroid/tup/internal/api"
+	"github.com/EmbeddedAndroid/tup/internal/backup"
+	"github.com/EmbeddedAndroid/tup/internal/tufvalidate"
 )
 
 var Version = "dev"

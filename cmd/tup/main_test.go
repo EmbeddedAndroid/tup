@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/foundriesio/tup/internal/api"
+	"github.com/EmbeddedAndroid/tup/internal/api"
 )
 
 func TestLoadManifest_AllFields(t *testing.T) {
