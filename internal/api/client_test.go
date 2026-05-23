@@ -16,8 +16,8 @@ func TestListNamespaces(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"factories": []Factory{
-				{RepoID: "rid-1", Name: "alpha", LatestRootVersion: 1, RootKeyID: "k1"},
-				{RepoID: "rid-2", Name: "beta", LatestRootVersion: 2, RootKeyID: "k2"},
+				{ProjectID: "rid-1", Name: "alpha", LatestRootVersion: 1, RootKeyID: "k1"},
+				{ProjectID: "rid-2", Name: "beta", LatestRootVersion: 2, RootKeyID: "k2"},
 			},
 		})
 	}))
@@ -44,7 +44,7 @@ func TestCreateNamespace(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(CreateResponse{
-			RepoID: "rid-new", Name: "acme", RootKeyID: "k0", RootVersion: 1,
+			ProjectID: "rid-new", Name: "acme", RootKeyID: "k0", RootVersion: 1,
 		})
 	}))
 	defer srv.Close()
@@ -53,7 +53,7 @@ func TestCreateNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RepoID != "rid-new" || got.RootVersion != 1 {
+	if got.ProjectID != "rid-new" || got.RootVersion != 1 {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -274,7 +274,7 @@ func TestBootstrapStage(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(BootstrapStageResponse{
-			StagingID: "stage1", RepoID: "rid-1", Name: "acme",
+			StagingID: "stage1", ProjectID: "rid-1", Name: "acme",
 			RootKeyID: "rootK", TargetsKeyID: "tK",
 			SnapshotKeyID: "sK", TimestampKeyID: "tsK",
 			BytesToSign:    []byte(`{"_type":"Root","version":1}`),
@@ -290,7 +290,7 @@ func TestBootstrapStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.StagingID != "stage1" || got.RepoID != "rid-1" || got.RootKeyID != "rootK" {
+	if got.StagingID != "stage1" || got.ProjectID != "rid-1" || got.RootKeyID != "rootK" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -307,7 +307,7 @@ func TestBootstrapFinalize(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(CreateResponse{
-			RepoID: "rid-1", Name: "acme",
+			ProjectID: "rid-1", Name: "acme",
 			RootKeyID: "rootK", RootVersion: 1,
 		})
 	}))
@@ -320,7 +320,7 @@ func TestBootstrapFinalize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RepoID != "rid-1" || got.RootVersion != 1 {
+	if got.ProjectID != "rid-1" || got.RootVersion != 1 {
 		t.Fatalf("got %+v", got)
 	}
 }

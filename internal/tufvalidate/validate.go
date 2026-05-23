@@ -31,7 +31,7 @@ import (
 // Result is what `tup validate` prints. Each role's verification is
 // either "ok" with the version it was checked at, or an error.
 type Result struct {
-	RepoID       string
+	ProjectID       string
 	LatestRoot   int
 	RootChain    []ChainStep
 	Timestamp    RoleVerification
@@ -59,7 +59,7 @@ type RoleVerification struct {
 // initial anchor (the customer-anchored equivalent of TOFU; for true
 // security the operator pins v1 out of band).
 func Validate(server, repo string) (*Result, error) {
-	r := &Result{RepoID: repo}
+	r := &Result{ProjectID: repo}
 	cli := &http.Client{}
 
 	// 1. Fetch root v1, use it as trust anchor.

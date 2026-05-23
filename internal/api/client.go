@@ -32,7 +32,7 @@ func New(baseURL string) *Client {
 // Factory matches tufd's NamespaceListEntry (wire-compat name; the
 // public CLI subcommand is `namespace`).
 type Factory struct {
-	RepoID            string `json:"repo_id"`
+	ProjectID            string `json:"project_id"`
 	Name              string `json:"name"`
 	LatestRootVersion int    `json:"latest_root_version"`
 	RootKeyID         string `json:"root_keyid,omitempty"`
@@ -44,7 +44,7 @@ type CreateRequest struct {
 }
 
 type CreateResponse struct {
-	RepoID      string `json:"repo_id"`
+	ProjectID      string `json:"project_id"`
 	Name        string `json:"name"`
 	RootKeyID   string `json:"root_keyid"`
 	RootVersion int    `json:"root_version"`
@@ -142,7 +142,7 @@ type BootstrapStageRequest struct {
 // BootstrapStageResponse mirrors tufd's BeginExternalRootResponse.
 type BootstrapStageResponse struct {
 	StagingID      string   `json:"staging_id"`
-	RepoID         string   `json:"repo_id"`
+	ProjectID         string   `json:"project_id"`
 	Name           string   `json:"name"`
 	RootKeyID      string   `json:"root_keyid"`
 	TargetsKeyID   string   `json:"targets_keyid"`
@@ -273,7 +273,7 @@ func (c *Client) FinalizeRotation(ctx context.Context, repoID string, req Finali
 // RegisterDeviceResponse mirrors tufd's device-register response.
 type RegisterDeviceResponse struct {
 	DeviceID string `json:"device_id"`
-	RepoID   string `json:"repo_id"`
+	ProjectID   string `json:"project_id"`
 	CertPEM  string `json:"cert_pem"`
 	KeyPEM   string `json:"key_pem"`
 	CAPEM    string `json:"ca_pem"`

@@ -35,27 +35,29 @@ Usage:
   tup [flags] <command> [args...]
 
 Commands:
-  namespace create <name>                       Create a new namespace
-  namespace list                                List all namespaces
-  namespace show <repo-id>                      Show the signed root role for a namespace
-  namespace rotate <repo-id>                    Rotate the root key (server-side dual-key)
-  namespace validate <repo-id>                  Walk the TUF chain end-to-end + verify all signatures
-  namespace create-with-key --name <n> --root-pubkey <file>
+  project create <name>                         Create a new project
+  project list                                  List all projects
+  project show <project-id>                     Show the signed root role for a project
+  project rotate <project-id>                   Rotate the root key (server-side dual-key)
+  project validate <project-id>                 Walk the TUF chain end-to-end + verify all signatures
+  project create-with-key --name <n> --root-pubkey <file>
                                                 Bootstrap with a customer-held offline root key (cold-key)
-  namespace finalize-create --staging-id <id> --signed <file>
+  project finalize-create --staging-id <id> --signed <file>
                                                 POST signed envelope to finalize cold-key bootstrap
-  namespace stage-rotation <repo-id> --new-pubkey <file>
+  project stage-rotation <project-id> --new-pubkey <file>
                                                 Start an offline rotation; downloads bytes-to-sign
   sign-rotation --tosign <file> --old-key <pem> --new-key <pem> -o <file>
                                                 Locally sign a staged rotation envelope (2 keys)
   sign-bootstrap --tosign <file> --key <pem> -o <file>
                                                 Locally sign a staged bootstrap envelope (1 key)
-  namespace finalize-rotation <repo-id> --signed <file>
+  project finalize-rotation <project-id> --signed <file>
                                                 POST a customer-signed envelope to commit the rotation
-  publish <repo-id> <name> <version>            Publish a new target into a namespace
-  unpublish <repo-id> <name> <version>          Remove a target (bumps targets/snapshot/timestamp)
+  publish <project-id> <name> <version>         Publish a new target into a project
+  unpublish <project-id> <name> <version>       Remove a target (bumps targets/snapshot/timestamp)
   version                                       Print version
   help                                          Show this help
+
+  (`+"`project`"+` was previously named `+"`namespace`"+`; the old name still works.)
 
 Global flags:
   -url <URL>                    tufd base URL (default $TUP_URL or http://localhost:9001)
@@ -87,9 +89,9 @@ publish flags:
                                 above; explicit flags override
 
 Examples:
-  tup namespace create acme
-  tup -json namespace list
-  tup -url https://tufd.internal:9001 namespace show 0d9eaef2-1234-...
+  tup project create acme
+  tup -json project list
+  tup -url https://tufd.internal:9001 project show 0d9eaef2-1234-...
   tup publish demo lmp 42 -sha256 abc123... -hardware intel-corei7-64 -tags main
   tup publish demo lmp 98 -manifest build-98.json -hardware intel-corei7-64
 `
@@ -120,7 +122,8 @@ func main() {
 		out.scalar("version", Version)
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stderr, help)
-	case "namespace":
+	case "project", "namespace":
+		// `namespace` kept as a backward-compat alias for one release.
 		runNamespace(ctx, client, args[1:], out)
 	case "publish":
 		runPublish(ctx, client, args[1:], out)
@@ -384,12 +387,12 @@ func parseAppPairs(s string) map[string]string {
 
 func runNamespace(ctx context.Context, c *api.Client, args []string, out output) {
 	if len(args) == 0 {
-		fail(fmt.Errorf("namespace needs a subcommand: create | list | show | rotate"))
+		fail(fmt.Errorf("project needs a subcommand: create | list | show | rotate"))
 	}
 	switch args[0] {
 	case "create":
 		if len(args) < 2 {
-			fail(fmt.Errorf("namespace create needs a name"))
+			fail(fmt.Errorf("project create needs a name"))
 		}
 		resp, err := c.CreateNamespace(ctx, api.CreateRequest{Name: args[1]})
 		if err != nil {
@@ -404,7 +407,7 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		out.namespaces(facts)
 	case "show":
 		if len(args) < 2 {
-			fail(fmt.Errorf("namespace show needs a repo-id"))
+			fail(fmt.Errorf("project show needs a project-id"))
 		}
 		body, checksum, err := c.FetchRoot(ctx, args[1])
 		if err != nil {
@@ -446,7 +449,7 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 	case "import-build":
 		runImportBuild(ctx, c, args[1:], out)
 	default:
-		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
+		fail(fmt.Errorf("unknown project subcommand: %s", args[0]))
 	}
 }
 
@@ -1409,7 +1412,7 @@ func (o output) namespaces(fs []api.Factory) {
 		if len(key) > 16 {
 			key = key[:8] + "…" + key[len(key)-4:]
 		}
-		fmt.Printf("%-40s  %-20s  root v%d  key %s\n", f.RepoID, f.Name, f.LatestRootVersion, key)
+		fmt.Printf("%-40s  %-20s  root v%d  key %s\n", f.ProjectID, f.Name, f.LatestRootVersion, key)
 	}
 }
 
@@ -1419,7 +1422,7 @@ func (o output) namespaceCreated(r *api.CreateResponse) {
 		return
 	}
 	fmt.Printf("created namespace %q\n", r.Name)
-	fmt.Printf("  repo_id:      %s\n", r.RepoID)
+	fmt.Printf("  repo_id:      %s\n", r.ProjectID)
 	fmt.Printf("  root_keyid:   %s\n", r.RootKeyID)
 	fmt.Printf("  root_version: %d\n", r.RootVersion)
 }
@@ -1428,7 +1431,7 @@ func (o output) bootstrapStageResult(r *api.BootstrapStageResponse, tosignPath s
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"staging_id":       r.StagingID,
-			"repo_id":          r.RepoID,
+			"project_id":          r.ProjectID,
 			"name":             r.Name,
 			"root_keyid":       r.RootKeyID,
 			"targets_keyid":    r.TargetsKeyID,
@@ -1441,7 +1444,7 @@ func (o output) bootstrapStageResult(r *api.BootstrapStageResponse, tosignPath s
 		return
 	}
 	fmt.Printf("staged namespace bootstrap: %q\n", r.Name)
-	fmt.Printf("  repo_id:           %s\n", r.RepoID)
+	fmt.Printf("  repo_id:           %s\n", r.ProjectID)
 	fmt.Printf("  staging_id:        %s\n", r.StagingID)
 	fmt.Printf("  expires:           %s\n", r.ExpiresAt)
 	fmt.Printf("  root keyid:        %s  (offline; you sign with this)\n", r.RootKeyID)
@@ -1488,7 +1491,7 @@ func (o output) validateResult(r *tufvalidate.Result) {
 		_ = json.NewEncoder(os.Stdout).Encode(r)
 		return
 	}
-	fmt.Printf("namespace %s — TUF chain validation\n", r.RepoID)
+	fmt.Printf("namespace %s — TUF chain validation\n", r.ProjectID)
 	fmt.Printf("\nroot chain (latest: v%d)\n", r.LatestRoot)
 	for _, step := range r.RootChain {
 		marker := "  ✓"
@@ -1543,7 +1546,7 @@ func (o output) registerDeviceResult(r *api.RegisterDeviceResponse, outDir strin
 		_ = json.NewEncoder(os.Stdout).Encode(r)
 		return
 	}
-	fmt.Printf("registered device %q in namespace %s\n", r.DeviceID, r.RepoID)
+	fmt.Printf("registered device %q in namespace %s\n", r.DeviceID, r.ProjectID)
 	fmt.Printf("  cert.pem   %s/cert.pem\n", outDir)
 	fmt.Printf("  key.pem    %s/key.pem  (0600)\n", outDir)
 	fmt.Printf("  ca.pem     %s/ca.pem\n", outDir)
@@ -1623,7 +1626,7 @@ func (o output) appListResult(rid string, apps []api.App) {
 func (o output) configSetResult(rid, name string, size int, unenc bool) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"repo_id": rid, "name": name, "size": size, "unencrypted": unenc,
+			"project_id": rid, "name": name, "size": size, "unencrypted": unenc,
 		})
 		return
 	}
@@ -1659,7 +1662,7 @@ func (o output) configListResult(rid string, files []api.ConfigFile) {
 func (o output) pinResult(rid, deviceID, target string) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
-			"repo_id": rid, "device_id": deviceID, "target": target,
+			"project_id": rid, "device_id": deviceID, "target": target,
 		})
 		return
 	}
@@ -1670,7 +1673,7 @@ func (o output) pinResult(rid, deviceID, target string) {
 func (o output) unpinResult(rid, deviceID, target string, removed int) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"repo_id": rid, "device_id": deviceID, "target": target, "removed": removed,
+			"project_id": rid, "device_id": deviceID, "target": target, "removed": removed,
 		})
 		return
 	}
@@ -1684,7 +1687,7 @@ func (o output) unpinResult(rid, deviceID, target string, removed int) {
 func (o output) pinsList(rid, deviceID string, pins []api.DevicePin) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"repo_id": rid, "device_id": deviceID, "pins": pins,
+			"project_id": rid, "device_id": deviceID, "pins": pins,
 		})
 		return
 	}
@@ -1739,7 +1742,7 @@ func (o output) publishResult(r *api.PublishResponse) {
 func (o output) namespaceRoot(repoID, checksum string, body []byte) {
 	if o.json {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"repo_id":  repoID,
+			"project_id":  repoID,
 			"checksum": checksum,
 			"root":     json.RawMessage(body),
 		})
