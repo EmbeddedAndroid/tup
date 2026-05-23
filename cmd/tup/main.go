@@ -123,6 +123,8 @@ func main() {
 		runNamespace(ctx, client, args[1:], out)
 	case "publish":
 		runPublish(ctx, client, args[1:], out)
+	case "ostree":
+		runOstreeSubcommand(ctx, client, args[1:], out)
 	case "unpublish":
 		runUnpublish(ctx, client, args[1:], out)
 	case "sign-rotation":
@@ -440,9 +442,132 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runAppSubcommand(ctx, c, args[1:], out)
 	case "wave":
 		runWaveSubcommand(ctx, c, args[1:], out)
+	case "import-build":
+		runImportBuild(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown namespace subcommand: %s", args[0]))
 	}
+}
+
+// runOstreeSubcommand dispatches `tup ostree <push>`. The push command
+// is the first-class "upload a Yocto build" path: walks a local
+// ostree archive repo and POSTs every object + PUTs every ref.
+func runOstreeSubcommand(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) == 0 {
+		fail(fmt.Errorf("ostree needs a subcommand: push"))
+	}
+	switch args[0] {
+	case "push":
+		runOstreePush(ctx, c, args[1:], out)
+	default:
+		fail(fmt.Errorf("unknown ostree subcommand: %s", args[0]))
+	}
+}
+
+func runOstreePush(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("ostree-push", flag.ExitOnError)
+	from := fs.String("from", "", "local ostree archive repo path (required)")
+	branch := fs.String("branch", "", "single branch to push (empty = all refs under refs/heads/)")
+	token := fs.String("admin-token", "", "TUFD_ADMIN_TOKEN value for OSF-TOKEN header (required)")
+	conc := fs.Int("c", 32, "concurrent uploads")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *from == "" || *token == "" {
+		fail(fmt.Errorf("ostree push <repo-id> --from <local-repo> --admin-token <T> [--branch X] [-c N]"))
+	}
+	repoID := fs.Args()[0]
+
+	start := time.Now()
+	stats, err := c.OstreePushRepo(ctx, repoID, *token, *from, *branch, *conc, func(s api.OstreePushStats) {
+		if (s.Uploaded+s.Skipped)%200 == 0 {
+			fmt.Fprintf(os.Stderr, "  progress: %d/%d (uploaded=%d skipped=%d errors=%d)\r",
+				s.Uploaded+s.Skipped, s.Total, s.Uploaded, s.Skipped, s.Errors)
+		}
+	})
+	dt := time.Since(start)
+	if err != nil {
+		fail(fmt.Errorf("after %s, %d/%d done: %w",
+			dt.Truncate(time.Millisecond), stats.Uploaded+stats.Skipped, stats.Total, err))
+	}
+	mb := float64(stats.Bytes) / 1024 / 1024
+	fmt.Fprintf(os.Stderr, "\nostree push %s done in %s:\n", repoID, dt.Truncate(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "  %d objects (uploaded %d / skipped %d / errors %d, %.1f MB)\n",
+		stats.Total, stats.Uploaded, stats.Skipped, stats.Errors, mb)
+}
+
+// runImportBuild orchestrates pushing a complete build (ostree repo +
+// compose-app bundles) from a local directory into a namespace. Same
+// shape as a Foundries `fioctl targets offline-update` bundle:
+//
+//   <bundle>/
+//     ostree_repo/         (archive repo)
+//     apps/<name>/<ver>/   (optional compose-app bundles)
+//
+// Resulting target metadata still needs `tup publish` to register the
+// commit as a Target (we don't auto-publish because the operator
+// usually picks the version + tags + hardware id).
+func runImportBuild(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("import-build", flag.ExitOnError)
+	from := fs.String("from", "", "bundle directory containing ostree_repo/ (required)")
+	branch := fs.String("branch", "", "single ostree branch to push (empty = all)")
+	token := fs.String("admin-token", "", "TUFD_ADMIN_TOKEN for OSF-TOKEN (required)")
+	conc := fs.Int("c", 32, "concurrent ostree object uploads")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *from == "" || *token == "" {
+		fail(fmt.Errorf("import-build <repo-id> --from <bundle> --admin-token <T> [--branch X] [-c N]"))
+	}
+	repoID := fs.Args()[0]
+
+	ostreeDir := filepath.Join(*from, "ostree_repo")
+	if st, err := os.Stat(ostreeDir); err != nil || !st.IsDir() {
+		fail(fmt.Errorf("missing %s -- bundle must contain an ostree_repo/ subdir", ostreeDir))
+	}
+	fmt.Fprintf(os.Stderr, "▶ pushing ostree archive from %s\n", ostreeDir)
+	start := time.Now()
+	stats, err := c.OstreePushRepo(ctx, repoID, *token, ostreeDir, *branch, *conc, nil)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "  ostree: %d objects (uploaded %d / skipped %d, %.1f MB) in %s\n",
+		stats.Total, stats.Uploaded, stats.Skipped, float64(stats.Bytes)/1024/1024,
+		time.Since(start).Truncate(time.Millisecond))
+
+	// Push compose-apps if the bundle has them.
+	appsDir := filepath.Join(*from, "apps")
+	if st, err := os.Stat(appsDir); err == nil && st.IsDir() {
+		count := 0
+		filepath.Walk(appsDir, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			// Layout: <bundle>/apps/<name>/<version>/<file>.tgz OR
+			// just <bundle>/apps/<name>/<version>.tgz
+			rel, _ := filepath.Rel(appsDir, p)
+			parts := strings.Split(rel, "/")
+			if len(parts) < 2 {
+				return nil
+			}
+			name := parts[0]
+			ver := strings.TrimSuffix(parts[1], ".tgz")
+			f, err := os.Open(p)
+			if err != nil {
+				return nil
+			}
+			defer f.Close()
+			if _, err := c.AppPush(ctx, repoID, name, ver, "import-build", f); err != nil {
+				fmt.Fprintf(os.Stderr, "  app push failed %s:%s -- %v\n", name, ver, err)
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "  pushed compose-app %s:%s\n", name, ver)
+			count++
+			return nil
+		})
+		fmt.Fprintf(os.Stderr, "  %d compose-app bundle(s) pushed\n", count)
+	}
+	fmt.Fprintf(os.Stderr, "\nnext: register the new commit as a Target with `tup publish %s <name> <ver> -ostree-commit <sha> ...`\n", repoID)
 }
 
 // runWaveSubcommand dispatches `tup namespace wave <create|list|delete|add|remove>`.

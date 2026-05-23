@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -400,6 +403,206 @@ func (c *Client) ListPins(ctx context.Context, repoID, deviceID string) ([]Devic
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	return body.Pins, nil
+}
+
+// OstreePushStats is a summary of one ostree-push run for the CLI.
+type OstreePushStats struct {
+	Total    int
+	Uploaded int
+	Skipped  int
+	Errors   int
+	Bytes    int64
+}
+
+// OstreeInit calls POST /ostree/init to ensure the per-namespace repo
+// directory + config exists. Idempotent on the server.
+func (c *Client) OstreeInit(ctx context.Context, repoID, adminToken string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/init", nil)
+	if adminToken != "" {
+		req.Header.Set("OSF-TOKEN", adminToken)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("ostree init", resp)
+	}
+	return nil
+}
+
+// OstreeHasObject is the HEAD-side check tup runs to skip already-
+// uploaded objects (cheap dedup).
+func (c *Client) OstreeHasObject(ctx context.Context, repoID, sha2, rest, adminToken string) bool {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/objects/"+sha2+"/"+rest, nil)
+	if adminToken != "" {
+		req.Header.Set("OSF-TOKEN", adminToken)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// OstreePutObject streams one ostree object's bytes to the server.
+// sha2 is the first two hex chars of the object hash, rest is the
+// remaining 58 hex chars + ".{commit,filez,dirtree,...}" extension.
+func (c *Client) OstreePutObject(ctx context.Context, repoID, sha2, rest, adminToken string, body io.Reader, size int64) (created bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/objects/"+sha2+"/"+rest, body)
+	if err != nil {
+		return false, err
+	}
+	req.ContentLength = size
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if adminToken != "" {
+		req.Header.Set("OSF-TOKEN", adminToken)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusCreated:
+		return true, nil
+	case http.StatusOK:
+		return false, nil
+	default:
+		return false, statusErr("ostree put object", resp)
+	}
+}
+
+// OstreePutRef writes refs/heads/<branch> = <commitSha>.
+func (c *Client) OstreePutRef(ctx context.Context, repoID, branch, commitSha, adminToken string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/refs/heads/"+branch,
+		bytes.NewReader([]byte(commitSha+"\n")))
+	req.Header.Set("Content-Type", "text/plain")
+	if adminToken != "" {
+		req.Header.Set("OSF-TOKEN", adminToken)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusErr("ostree put ref", resp)
+	}
+	return nil
+}
+
+// OstreePushRepo walks a local archive repo + POSTs every object,
+// then PUTs each branch ref. Concurrent uploads with HEAD-dedup.
+// Returns counts + a single error from the last failed object (caller
+// can choose to abort or continue based on the failures count).
+func (c *Client) OstreePushRepo(ctx context.Context, repoID, adminToken, localRepo, branch string, concurrency int, progress func(stats OstreePushStats)) (OstreePushStats, error) {
+	if err := c.OstreeInit(ctx, repoID, adminToken); err != nil {
+		return OstreePushStats{}, fmt.Errorf("init: %w", err)
+	}
+
+	// 1. Enumerate every object file.
+	objectsRoot := filepath.Join(localRepo, "objects")
+	type job struct{ sha2, rest, full string; size int64 }
+	var jobs []job
+	if err := filepath.Walk(objectsRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(objectsRoot, path)
+		parts := strings.SplitN(rel, "/", 2)
+		if len(parts) != 2 || len(parts[0]) != 2 {
+			return nil
+		}
+		jobs = append(jobs, job{sha2: parts[0], rest: parts[1], full: path, size: info.Size()})
+		return nil
+	}); err != nil {
+		return OstreePushStats{}, fmt.Errorf("walk objects: %w", err)
+	}
+
+	stats := OstreePushStats{Total: len(jobs)}
+	var mu sync.Mutex
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j job) {
+			defer func() { <-sem; wg.Done() }()
+			if c.OstreeHasObject(ctx, repoID, j.sha2, j.rest, adminToken) {
+				mu.Lock()
+				stats.Skipped++
+				if progress != nil {
+					progress(stats)
+				}
+				mu.Unlock()
+				return
+			}
+			f, err := os.Open(j.full)
+			if err != nil {
+				mu.Lock()
+				stats.Errors++
+				mu.Unlock()
+				return
+			}
+			created, err := c.OstreePutObject(ctx, repoID, j.sha2, j.rest, adminToken, f, j.size)
+			f.Close()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				stats.Errors++
+				return
+			}
+			if created {
+				stats.Uploaded++
+				stats.Bytes += j.size
+			} else {
+				stats.Skipped++
+			}
+			if progress != nil {
+				progress(stats)
+			}
+		}(jobs[i])
+	}
+	wg.Wait()
+
+	// 2. PUT refs. If branch is empty, walk every ref under refs/heads.
+	refsRoot := filepath.Join(localRepo, "refs/heads")
+	branches := map[string]string{}
+	if branch != "" {
+		sha, err := os.ReadFile(filepath.Join(refsRoot, branch))
+		if err != nil {
+			return stats, fmt.Errorf("read ref %s: %w", branch, err)
+		}
+		branches[branch] = strings.TrimSpace(string(sha))
+	} else {
+		_ = filepath.Walk(refsRoot, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(refsRoot, path)
+			sha, err := os.ReadFile(path)
+			if err == nil {
+				branches[rel] = strings.TrimSpace(string(sha))
+			}
+			return nil
+		})
+	}
+	for b, sha := range branches {
+		if err := c.OstreePutRef(ctx, repoID, b, sha, adminToken); err != nil {
+			return stats, fmt.Errorf("put ref %s: %w", b, err)
+		}
+	}
+	return stats, nil
 }
 
 // Wave mirrors tufd's repostore.Wave.
