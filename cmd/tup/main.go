@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"crypto/ed25519"
@@ -430,6 +432,8 @@ func runNamespace(ctx context.Context, c *api.Client, args []string, out output)
 		runRegisterDevice(ctx, c, args[1:], out)
 	case "get-ca":
 		runGetCA(ctx, c, args[1:], out)
+	case "export-offline-keys":
+		runExportOfflineKeys(ctx, c, args[1:], out)
 	case "backup":
 		runBackup(ctx, c, args[1:], out)
 	case "restore":
@@ -1064,6 +1068,92 @@ func runGetCA(ctx context.Context, c *api.Client, args []string, out output) {
 		fail(err)
 	}
 	fmt.Printf("wrote ca cert to %s (%d bytes)\n", *outPath, len(pem))
+}
+
+// runExportOfflineKeys writes a fioctl-compatible offline-creds.tgz
+// containing the project's online targets role keypair, packed as
+//
+//	tufrepo/keys/fioctl-targets-<kid>.pub  AtsKey JSON (public only)
+//	tufrepo/keys/fioctl-targets-<kid>.sec  AtsKey JSON (public + private)
+//
+// `fioctl waves init -k <this-file> ...` will then find our targets
+// key in the tarball, sign the wave's targets metadata client-side,
+// and POST to /ota/factories/{f}/waves/. On the server side our wave
+// shim accepts the signed blob and seeds the wave from its target
+// keys map.
+//
+// We export the targets key because it's the only key fioctl needs
+// for `waves init` and `targets sign`. Root, snapshot, timestamp
+// keys never leave tufd's keystore.
+func runExportOfflineKeys(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("export-offline-keys", flag.ExitOnError)
+	outPath := fs.String("out", "offline-creds.tgz", "tarball output path")
+	role := fs.String("role", "targets", "role to export (targets only for now)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 {
+		fail(fmt.Errorf("export-offline-keys <repo-id> [--out file.tgz] [--role targets]"))
+	}
+	repoID := fs.Args()[0]
+	if *role != "targets" {
+		fail(fmt.Errorf("only --role=targets is supported"))
+	}
+	key, err := c.ExportRoleKey(ctx, repoID, *role)
+	if err != nil {
+		fail(err)
+	}
+	if key.KeyType != "ed25519" {
+		fail(fmt.Errorf("export-offline-keys: unsupported key type %q", key.KeyType))
+	}
+	// AtsKey shape fioctl expects.
+	pubJSON, _ := json.Marshal(map[string]any{
+		"keytype": key.KeyType,
+		"keyval":  map[string]string{"public": key.Public},
+	})
+	secJSON, _ := json.Marshal(map[string]any{
+		"keytype": key.KeyType,
+		"keyval":  map[string]string{"public": key.Public, "private": key.Private},
+	})
+	base := fmt.Sprintf("tufrepo/keys/fioctl-%s-%s", *role, key.KID)
+	files := []struct {
+		name string
+		data []byte
+	}{
+		{base + ".pub", pubJSON},
+		{base + ".sec", secJSON},
+	}
+
+	f, err := os.Create(*outPath)
+	if err != nil {
+		fail(err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for _, e := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:    e.name,
+			Mode:    0o600,
+			Size:    int64(len(e.data)),
+			ModTime: time.Now(),
+		}); err != nil {
+			fail(err)
+		}
+		if _, err := tw.Write(e.data); err != nil {
+			fail(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		fail(err)
+	}
+	if err := gz.Close(); err != nil {
+		fail(err)
+	}
+	fmt.Printf("wrote offline-creds tarball: %s\n  role:    %s\n  keytype: %s\n  kid:     %s\n",
+		*outPath, *role, key.KeyType, key.KID)
+	fmt.Printf("Use with fioctl: fioctl waves init -k %s <wave-name> <version> <tag>\n", *outPath)
+	_ = out
 }
 
 // runCreateWithKey: POST /api/v1/user_repo/_bootstrap-stage with the

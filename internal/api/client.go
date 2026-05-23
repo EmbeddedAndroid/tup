@@ -299,6 +299,69 @@ func (c *Client) RegisterDevice(ctx context.Context, repoID, deviceID string) (*
 	return &out, nil
 }
 
+// firstNonEmpty returns the first non-empty arg. Used to pick the
+// admin token from env vars with reasonable fallbacks.
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ExportedRoleKey mirrors tufd's handleExportRoleKey response shape.
+type ExportedRoleKey struct {
+	Role    string
+	KID     string
+	KeyType string
+	Public  string
+	Private string
+}
+
+// ExportRoleKey fetches a role's private key in AtsKey JSON form so
+// the operator can pack a fioctl-compatible offline-creds.tgz tarball.
+// Requires TUP_ADMIN_TOKEN env (or TUFD_ADMIN_TOKEN) to authenticate
+// — the endpoint is guarded server-side because it exposes private
+// key material.
+func (c *Client) ExportRoleKey(ctx context.Context, repoID, role string) (*ExportedRoleKey, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.BaseURL+"/api/v1/user_repo/"+repoID+"/keys/"+role+"/export", nil)
+	if err != nil {
+		return nil, err
+	}
+	if tok := firstNonEmpty(os.Getenv("TUP_ADMIN_TOKEN"), os.Getenv("TUFD_ADMIN_TOKEN")); tok != "" {
+		req.Header.Set("OSF-TOKEN", tok)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("export role key", resp)
+	}
+	var raw struct {
+		Role    string `json:"role"`
+		KID     string `json:"kid"`
+		KeyType string `json:"keytype"`
+		KeyVal  struct {
+			Public  string `json:"public"`
+			Private string `json:"private"`
+		} `json:"keyval"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("api: decode export-role-key: %w", err)
+	}
+	return &ExportedRoleKey{
+		Role:    raw.Role,
+		KID:     raw.KID,
+		KeyType: raw.KeyType,
+		Public:  raw.KeyVal.Public,
+		Private: raw.KeyVal.Private,
+	}, nil
+}
+
 // GetCA returns the namespace's device-CA cert PEM. devgw uses this
 // to verify incoming device client certs over mTLS.
 func (c *Client) GetCA(ctx context.Context, repoID string) ([]byte, error) {
