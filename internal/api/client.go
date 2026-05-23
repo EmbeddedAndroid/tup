@@ -675,12 +675,21 @@ type Wave struct {
 	CreatedAt  int64    `json:"created_at,omitempty"`
 	CreatedBy  string   `json:"created_by,omitempty"`
 	Members    []string `json:"members,omitempty"`
+	GroupID    *int64   `json:"group_id,omitempty"`
 }
 
-func (c *Client) WaveCreate(ctx context.Context, repoID, name string, targetKeys []string, by string) error {
-	body, _ := json.Marshal(map[string]any{
+// WaveCreate creates or replaces a wave. groupID is optional: passing
+// a non-nil value makes the wave group-scoped (dynamic membership
+// follows devices.group_id matches); nil keeps the legacy explicit-
+// list behavior driven by wave_members.
+func (c *Client) WaveCreate(ctx context.Context, repoID, name string, targetKeys []string, by string, groupID *int64) error {
+	payload := map[string]any{
 		"name": name, "target_keys": targetKeys, "created_by": by,
-	})
+	}
+	if groupID != nil {
+		payload["group_id"] = *groupID
+	}
+	body, _ := json.Marshal(payload)
 	resp, err := c.do(ctx, http.MethodPost, "/api/v1/user_repo/"+repoID+"/waves", body)
 	if err != nil {
 		return err
@@ -690,6 +699,38 @@ func (c *Client) WaveCreate(ctx context.Context, repoID, name string, targetKeys
 		return statusErr("wave create", resp)
 	}
 	return nil
+}
+
+// DeviceGroup mirrors tufd's configstore.Group; minimal shape for
+// "look up the group_id from a name" used by wave-create's --group
+// flag.
+type DeviceGroup struct {
+	GroupID     int64  `json:"group_id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// GroupGetByName fetches the device group with the given name, or
+// returns ErrNotFound if absent.
+func (c *Client) GroupGetByName(ctx context.Context, repoID, name string) (*DeviceGroup, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/groups", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("groups list", resp)
+	}
+	var body struct {
+		Groups []DeviceGroup `json:"groups"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	for _, g := range body.Groups {
+		if g.Name == name {
+			return &g, nil
+		}
+	}
+	return nil, fmt.Errorf("device group %q not found in project %s", name, repoID)
 }
 
 func (c *Client) WaveList(ctx context.Context, repoID string) ([]Wave, error) {

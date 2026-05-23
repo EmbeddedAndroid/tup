@@ -865,20 +865,34 @@ func runWaveCreate(ctx context.Context, c *api.Client, args []string, out output
 	name := fs.String("name", "", "wave name (required)")
 	tgts := fs.String("targets", "", "comma-separated target_keys")
 	by := fs.String("by", "", "creator actor")
+	group := fs.String("group", "", "device-group name; makes the wave group-scoped (dynamic membership)")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
 	if len(fs.Args()) < 1 || *name == "" {
-		fail(fmt.Errorf("wave create <repo-id> --name X [--targets k1,k2] [--by actor]"))
+		fail(fmt.Errorf("wave create <repo-id> --name X [--targets k1,k2] [--group NAME] [--by actor]"))
 	}
 	keys := []string{}
 	if *tgts != "" {
 		keys = strings.Split(*tgts, ",")
 	}
-	if err := c.WaveCreate(ctx, fs.Args()[0], *name, keys, *by); err != nil {
+	var groupID *int64
+	repoID := fs.Args()[0]
+	if *group != "" {
+		g, err := c.GroupGetByName(ctx, repoID, *group)
+		if err != nil {
+			fail(fmt.Errorf("resolve --group %q: %w", *group, err))
+		}
+		groupID = &g.GroupID
+	}
+	if err := c.WaveCreate(ctx, repoID, *name, keys, *by, groupID); err != nil {
 		fail(err)
 	}
-	fmt.Printf("wave %q created in %s with %d target(s)\n", *name, fs.Args()[0], len(keys))
+	suffix := ""
+	if groupID != nil {
+		suffix = fmt.Sprintf(" (scoped to group %q, id=%d)", *group, *groupID)
+	}
+	fmt.Printf("wave %q created in %s with %d target(s)%s\n", *name, repoID, len(keys), suffix)
 }
 
 func runWaveList(ctx context.Context, c *api.Client, args []string, out output) {
