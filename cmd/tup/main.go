@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -459,9 +460,56 @@ func runOstreeSubcommand(ctx context.Context, c *api.Client, args []string, out 
 	switch args[0] {
 	case "push":
 		runOstreePush(ctx, c, args[1:], out)
+	case "gen-delta":
+		runOstreeGenDelta(ctx, c, args[1:], out)
+	case "list-deltas":
+		runOstreeListDeltas(ctx, c, args[1:], out)
 	default:
 		fail(fmt.Errorf("unknown ostree subcommand: %s", args[0]))
 	}
+}
+
+func runOstreeGenDelta(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("ostree-gen-delta", flag.ExitOnError)
+	from := fs.String("from", "", "source commit sha (required)")
+	to := fs.String("to", "", "target commit sha (required)")
+	token := fs.String("admin-token", "", "TUFD_ADMIN_TOKEN (required)")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) < 1 || *from == "" || *to == "" || *token == "" {
+		fail(fmt.Errorf("ostree gen-delta <repo-id> --from <sha> --to <sha> --admin-token <T>"))
+	}
+	rid := fs.Args()[0]
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/api/v1/user_repo/"+rid+"/ostree/deltas?from="+*from+"&to="+*to, nil)
+	req.Header.Set("OSF-TOKEN", *token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		fail(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fail(fmt.Errorf("status=%d body=%s", resp.StatusCode, body))
+	}
+	fmt.Printf("delta generated: %s\n", body)
+}
+
+func runOstreeListDeltas(ctx context.Context, c *api.Client, args []string, out output) {
+	if len(args) < 1 {
+		fail(fmt.Errorf("ostree list-deltas <repo-id>"))
+	}
+	rid := args[0]
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.BaseURL+"/api/v1/user_repo/"+rid+"/ostree/deltas", nil)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		fail(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println(string(body))
 }
 
 func runOstreePush(ctx context.Context, c *api.Client, args []string, out output) {
