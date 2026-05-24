@@ -1012,6 +1012,22 @@ func (c *Client) PublishTarget(ctx context.Context, repoID string, req PublishRe
 	return &out, nil
 }
 
+// FetchTargets returns the raw signed targets.json for a namespace.
+// The body is the full ats-targets envelope (signed.targets.* etc.).
+// Used by `tup publish` to look up the latest target for a
+// (hwid, tag) pair when filling in carry-forward fields.
+func (c *Client) FetchTargets(ctx context.Context, repoID string) ([]byte, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/user_repo/"+repoID+"/targets.json", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusErr("fetch targets", resp)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // FetchRoot returns the raw signed root role for a namespace and the
 // x-ats-role-checksum value the server advertises.
 func (c *Client) FetchRoot(ctx context.Context, repoID string) ([]byte, string, error) {

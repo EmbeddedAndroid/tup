@@ -270,6 +270,51 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 		req.ContainersSHA = *containersSHA
 	}
 
+	// Symmetric carry-forward: if the operator supplied only one of
+	// (ostree-commit, apps), look up the newest matching target for
+	// (project, first hwid, first tag) and inherit the missing piece.
+	// This closes two gaps:
+	//   1. App-only republish (operator didn't pass -ostree-commit):
+	//      we'd otherwise refuse with "publish: -sha256 ... required".
+	//   2. Yocto-rebuild app-regression (no -app passed): we'd write
+	//      an empty apps map, regressing devices to no-apps.
+	// Skip when both are present (clean publish), or when neither
+	// hwid+tag is set (no way to query).
+	missingSHA := req.SHA256 == ""
+	missingApps := len(req.ComposeApps) == 0
+	if (missingSHA || missingApps) && len(req.HardwareIDs) > 0 && len(req.Tags) > 0 && req.TargetFormat == "OSTREE" {
+		raw, err := c.FetchTargets(ctx, repoID)
+		if err != nil {
+			fail(fmt.Errorf("publish: carry-forward targets fetch: %w", err))
+		}
+		base, err := findLatestTarget(raw, req.HardwareIDs[0], req.Tags[0])
+		if err != nil {
+			fail(fmt.Errorf("publish: carry-forward parse: %w", err))
+		}
+		if base != nil {
+			if missingSHA {
+				req.SHA256 = base.sha256
+				req.Length = base.length
+				fmt.Fprintf(os.Stderr, "▶ inherit ostree-commit from %s-%s: %s\n",
+					base.name, base.versionStr, base.sha256)
+			}
+			if missingApps && len(base.apps) > 0 {
+				req.ComposeApps = make(map[string]string, len(base.apps))
+				for k, v := range base.apps {
+					req.ComposeApps[k] = v
+				}
+				fmt.Fprintf(os.Stderr, "▶ inherit %d compose-app(s) from %s-%s\n",
+					len(base.apps), base.name, base.versionStr)
+			}
+		}
+	}
+
+	// composectl/aktualizr refuses tag-ref or unpinned compose-app
+	// URIs at install time. Reject early with a clear message.
+	if err := validateAppPins(req.ComposeApps); err != nil {
+		fail(fmt.Errorf("publish: %w", err))
+	}
+
 	if req.SHA256 == "" {
 		fail(fmt.Errorf("publish: -sha256 (or -ostree-commit, or manifest's sha256) is required"))
 	}
