@@ -838,6 +838,9 @@ func runComposePublish(ctx context.Context, c *api.Client, args []string, out ou
 	name := fs.String("name", "", "compose-app name (default: dir basename)")
 	version := fs.String("version", "", "compose-app version (default: unix timestamp)")
 	by := fs.String("by", "", "actor recording the upload (default: 'compose-publish')")
+	registry := fs.String("registry", envOr("TUP_REGISTRY", ""), "OCI registry host:port (e.g. stack:5000); if set, publish as OCI artifact rather than legacy devgw tarball")
+	registryUser := fs.String("registry-user", envOr("TUP_REGISTRY_USER", "admin"), "registry basic-auth user (default: admin)")
+	registryToken := fs.String("registry-token", envOr("TUFD_ADMIN_TOKEN", ""), "registry basic-auth token (default: $TUFD_ADMIN_TOKEN)")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
@@ -892,6 +895,20 @@ func runComposePublish(ctx context.Context, c *api.Client, args []string, out ou
 	fmt.Fprintf(os.Stderr, "  app          : %s:%s\n", *name, *version)
 	fmt.Fprintf(os.Stderr, "  project      : %s\n", project)
 
+	// composeFinal carries the bytes that will be tarred as
+	// docker-compose.yml. For the OCI path we resolve every
+	// `image: foo:tag` to `image: foo@sha256:digest` before bundling;
+	// composectl rejects unpinned service images on pull.
+	composeFinal := cb
+	if *registry != "" {
+		pinned, err := pinComposeServiceImages(ctx, cb, *registry, *registryUser, *registryToken)
+		if err != nil {
+			fail(fmt.Errorf("compose-publish: pin service images: %w", err))
+		}
+		composeFinal = pinned
+		fmt.Fprintf(os.Stderr, "  service pins :\n%s", indentLines(string(pinned), "    "))
+	}
+
 	// Tar the dir into an in-memory buffer. compose-app bundles are
 	// tiny (KB-MB) — no streaming needed.
 	var buf bytes.Buffer
@@ -916,6 +933,18 @@ func runComposePublish(ctx context.Context, c *api.Client, args []string, out ou
 			return err
 		}
 		hdr.Name = filepath.ToSlash(rel)
+		// Swap in the pinned compose bytes when we hit the compose file.
+		if p == composePath {
+			hdr.Size = int64(len(composeFinal))
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if _, err := tw.Write(composeFinal); err != nil {
+				return err
+			}
+			count++
+			return nil
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
@@ -940,6 +969,37 @@ func runComposePublish(ctx context.Context, c *api.Client, args []string, out ou
 	_ = gz.Close()
 	fmt.Fprintf(os.Stderr, "  bundle       : %d file(s), %.1f KB\n", count, float64(buf.Len())/1024)
 
+	// OCI artifact path: push to the on-prem registry so stock LmP
+	// composectl (which only knows OCI distribution) can pull. Required
+	// for any OTA install that goes through aktualizr-lite.
+	if *registry != "" {
+		repo := project + "/" + *name
+		digest, ref, err := pushOCIArtifact(ctx, *registry, repo, *version, buf.Bytes(), *registryUser, *registryToken)
+		if err != nil {
+			fail(fmt.Errorf("oci publish: %w", err))
+		}
+		fmt.Fprintf(os.Stderr, "  manifest     : %s\n", digest)
+		fmt.Fprintf(os.Stderr, "  reference    : %s\n", ref)
+		fmt.Fprintf(os.Stderr, "\n  Use this in a publish:\n")
+		fmt.Fprintf(os.Stderr, "    tup publish %s <target-name> <version> \\\n", project)
+		fmt.Fprintf(os.Stderr, "      -ostree-commit <commit> -hardware <hwid> -tags <tag> \\\n")
+		fmt.Fprintf(os.Stderr, "      -app %s=%s\n\n", *name, ref)
+		// Record the publish in tufd's app store too so /api/v1/user_repo/<p>/compose-apps lists it.
+		app, err := c.AppPush(ctx, project, *name, *version, *by, bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			// Non-fatal: artifact is already in the registry; we just
+			// failed to update the app-list. Operator can still publish
+			// a target via the registry ref above.
+			fmt.Fprintf(os.Stderr, "  warning: app-list register failed: %v\n", err)
+		} else {
+			out.appPushResult(project, app)
+		}
+		return
+	}
+
+	// Legacy path: tarball stored via devgw URL. Kept for backwards
+	// compatibility with operator flows that haven't moved to the OCI
+	// registry. Devices cannot consume compose-apps from this path.
 	app, err := c.AppPush(ctx, project, *name, *version, *by, &buf)
 	if err != nil {
 		fail(fmt.Errorf("app push: %w", err))
