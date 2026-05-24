@@ -360,3 +360,56 @@ func errorsAs(err error, target any) bool {
 	}
 	return false
 }
+
+// TestClientDo_SetsOSFTokenFromEnv is the regression test for the
+// missing-auth bug that caused tup publish to land unauthenticated
+// at tufd's /api/v1/user_repo/<rid>/publish endpoint while the
+// dedicated ostree push path worked. do() now picks up the admin
+// token from env so EVERY API call inherits auth without each
+// helper having to remember.
+func TestClientDo_SetsOSFTokenFromEnv(t *testing.T) {
+	t.Setenv("TUP_ADMIN_TOKEN", "secret-tok-abc")
+
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("OSF-TOKEN")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"target_key":"k","targets_version":1,"snapshot_version":1,"timestamp_version":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	_, err := c.PublishTarget(context.Background(), "demo", PublishRequest{
+		Name: "img", Version: "1", TargetFormat: "OSTREE", SHA256: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("PublishTarget: %v", err)
+	}
+	if gotHeader != "secret-tok-abc" {
+		t.Errorf("OSF-TOKEN not forwarded: got %q want secret-tok-abc", gotHeader)
+	}
+}
+
+// TestClientDo_TufdTokenFallback covers the second env var name we
+// recognize (TUFD_ADMIN_TOKEN). Operators sometimes export the
+// server-side env name; tup should honor it as a fallback.
+func TestClientDo_TufdTokenFallback(t *testing.T) {
+	t.Setenv("TUP_ADMIN_TOKEN", "")
+	t.Setenv("TUFD_ADMIN_TOKEN", "fallback-token")
+
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("OSF-TOKEN")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"target_key":"k","targets_version":1,"snapshot_version":1,"timestamp_version":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	_, _ = c.PublishTarget(context.Background(), "demo", PublishRequest{
+		Name: "img", Version: "1", TargetFormat: "OSTREE", SHA256: "deadbeef",
+	})
+	if gotHeader != "fallback-token" {
+		t.Errorf("TUFD_ADMIN_TOKEN fallback lost: got %q", gotHeader)
+	}
+}

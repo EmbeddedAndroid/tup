@@ -1034,6 +1034,15 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// Pick up the admin token from env so every caller of do()
+	// inherits auth — historically PublishTarget + UnpublishTarget
+	// + the wave/config helpers went out unauthenticated and only
+	// the explicit OstreePush + ExportRoleKey paths set the header.
+	// The server's requireAdmin gate still validates the token
+	// value; this just makes sure it's PRESENT on every request.
+	if tok := firstNonEmpty(os.Getenv("TUP_ADMIN_TOKEN"), os.Getenv("TUFD_ADMIN_TOKEN")); tok != "" {
+		req.Header.Set("OSF-TOKEN", tok)
+	}
 	return c.HTTP.Do(req)
 }
 
