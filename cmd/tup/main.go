@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto"
@@ -138,6 +139,8 @@ func main() {
 		runUnpublish(ctx, client, args[1:], out)
 	case "yocto-publish":
 		runYoctoPublish(ctx, client, args[1:], out)
+	case "compose-publish":
+		runComposePublish(ctx, client, args[1:], out)
 	case "sign-rotation":
 		// Top-level (not under `namespace`) because the operation is
 		// offline + local — it doesn't talk to tufd. The customer
@@ -760,6 +763,133 @@ func runYoctoPublish(ctx context.Context, c *api.Client, args []string, out outp
 		fail(fmt.Errorf("publish target: %w", err))
 	}
 	out.publishResult(resp)
+}
+
+// runComposePublish bundles a directory containing a docker-compose
+// file into a compose-app tarball and POSTs it to the project's app
+// store. Skips actually building images — operators are expected to
+// have already pushed the images referenced inside docker-compose.yml
+// to a registry the devices can reach.
+//
+// Usage:
+//
+//	TUP_URL=…  TUP_ADMIN_TOKEN=…  TUP_PROJECT=…  \
+//	  tup compose-publish ./myapp [--name X] [--version V]
+//
+// Defaults: --name from the dir basename, --version from a unix
+// timestamp.
+func runComposePublish(ctx context.Context, c *api.Client, args []string, out output) {
+	fs := flag.NewFlagSet("compose-publish", flag.ExitOnError)
+	name := fs.String("name", "", "compose-app name (default: dir basename)")
+	version := fs.String("version", "", "compose-app version (default: unix timestamp)")
+	by := fs.String("by", "", "actor recording the upload (default: 'compose-publish')")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	if len(fs.Args()) != 1 {
+		fail(fmt.Errorf("usage: tup compose-publish [flags] <dir>"))
+	}
+	dir := fs.Args()[0]
+
+	project := envOr("TUP_PROJECT", "")
+	if project == "" {
+		fail(fmt.Errorf("TUP_PROJECT not set"))
+	}
+
+	// Locate the compose file. Accept docker-compose.yml or
+	// compose.yml; reject silently if neither is present.
+	var composePath string
+	for _, candidate := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+		p := filepath.Join(dir, candidate)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			composePath = p
+			break
+		}
+	}
+	if composePath == "" {
+		fail(fmt.Errorf("no docker-compose.yml in %s — compose-publish expects a compose file at the root of the bundle dir", dir))
+	}
+
+	// Best-effort YAML validation: read the file + ensure it parses
+	// as a YAML map with a top-level services: key. We use a hand-
+	// rolled check rather than dragging in a YAML parser dep.
+	cb, err := os.ReadFile(composePath)
+	if err != nil {
+		fail(fmt.Errorf("read compose file: %w", err))
+	}
+	if !bytes.Contains(cb, []byte("\nservices:")) && !bytes.HasPrefix(cb, []byte("services:")) {
+		fail(fmt.Errorf("%s: no top-level 'services:' key — is this really a docker-compose file?", composePath))
+	}
+
+	if *name == "" {
+		*name = filepath.Base(filepath.Clean(dir))
+	}
+	if *version == "" {
+		*version = fmt.Sprintf("%d", time.Now().Unix())
+	}
+	if *by == "" {
+		*by = "compose-publish"
+	}
+
+	fmt.Fprintf(os.Stderr, "▶ compose-publish\n")
+	fmt.Fprintf(os.Stderr, "  dir          : %s\n", dir)
+	fmt.Fprintf(os.Stderr, "  compose file : %s\n", composePath)
+	fmt.Fprintf(os.Stderr, "  app          : %s:%s\n", *name, *version)
+	fmt.Fprintf(os.Stderr, "  project      : %s\n", project)
+
+	// Tar the dir into an in-memory buffer. compose-app bundles are
+	// tiny (KB-MB) — no streaming needed.
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	root := filepath.Clean(dir)
+	count := 0
+	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		if rel == "." {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := io.Copy(tw, f); err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		fail(fmt.Errorf("tar %s: %w", dir, err))
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	fmt.Fprintf(os.Stderr, "  bundle       : %d file(s), %.1f KB\n", count, float64(buf.Len())/1024)
+
+	app, err := c.AppPush(ctx, project, *name, *version, *by, &buf)
+	if err != nil {
+		fail(fmt.Errorf("app push: %w", err))
+	}
+	out.appPushResult(project, app)
 }
 
 // runImportBuild orchestrates pushing a complete build (ostree repo +
