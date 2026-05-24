@@ -413,3 +413,79 @@ func TestClientDo_TufdTokenFallback(t *testing.T) {
 		t.Errorf("TUFD_ADMIN_TOKEN fallback lost: got %q", gotHeader)
 	}
 }
+
+// TestNew_PicksUpAdminTokenFromEnv closes task #67. Pre-fix the
+// admin token had to be plumbed as a parameter to every helper that
+// wrote its own *http.Request (OstreeInit, OstreePutObject, etc.),
+// which led to silent 401s when a helper forgot the Set("OSF-TOKEN",
+// ...) line. The constructor now reads the env once + the Client
+// uses it on every request.
+func TestNew_PicksUpAdminTokenFromEnv(t *testing.T) {
+	t.Run("TUP_ADMIN_TOKEN preferred", func(t *testing.T) {
+		t.Setenv("TUP_ADMIN_TOKEN", "tup-token")
+		t.Setenv("TUFD_ADMIN_TOKEN", "tufd-token")
+		c := New("http://x")
+		if c.AdminToken != "tup-token" {
+			t.Errorf("AdminToken = %q, want tup-token (TUP_ADMIN_TOKEN takes precedence)", c.AdminToken)
+		}
+	})
+	t.Run("TUFD_ADMIN_TOKEN fallback", func(t *testing.T) {
+		t.Setenv("TUP_ADMIN_TOKEN", "")
+		t.Setenv("TUFD_ADMIN_TOKEN", "fallback-token")
+		c := New("http://x")
+		if c.AdminToken != "fallback-token" {
+			t.Errorf("AdminToken = %q, want fallback-token", c.AdminToken)
+		}
+	})
+	t.Run("neither set → empty", func(t *testing.T) {
+		t.Setenv("TUP_ADMIN_TOKEN", "")
+		t.Setenv("TUFD_ADMIN_TOKEN", "")
+		c := New("http://x")
+		if c.AdminToken != "" {
+			t.Errorf("AdminToken = %q, want empty", c.AdminToken)
+		}
+	})
+}
+
+// TestClient_SetsOsfTokenOnAllPaths walks every code path that
+// builds its own *http.Request (not via do()) and asserts the
+// OSF-TOKEN header is present. Pre-#67 each path set the header
+// itself; if any path forgot, requests went out unauthenticated
+// + the server's requireAdmin returned 401.
+func TestClient_SetsOsfTokenOnAllPaths(t *testing.T) {
+	t.Setenv("TUP_ADMIN_TOKEN", "header-canary")
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("OSF-TOKEN"))
+		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/init") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	c := New(srv.URL)
+
+	ctx := context.Background()
+	_ = c.OstreeInit(ctx, "rid-1", "")
+	_ = c.OstreeHasObject(ctx, "rid-1", "ab", "cdef.commit", "")
+	_, _ = c.OstreePutObject(ctx, "rid-1", "ab", "cdef.commit", "", strings.NewReader("x"), 1)
+	_ = c.OstreePutRef(ctx, "rid-1", "main", "deadbeef", "")
+
+	for i, got := range seen {
+		if got != "header-canary" {
+			t.Errorf("request %d: OSF-TOKEN = %q, want header-canary", i, got)
+		}
+	}
+	if len(seen) != 4 {
+		t.Errorf("got %d requests, want 4", len(seen))
+	}
+}

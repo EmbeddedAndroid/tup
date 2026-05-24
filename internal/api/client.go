@@ -20,12 +20,27 @@ import (
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	// AdminToken is the OSF-TOKEN value sent on every request. Read
+	// from TUP_ADMIN_TOKEN/TUFD_ADMIN_TOKEN at constructor time so
+	// every helper inherits auth without a per-call parameter.
+	AdminToken string
 }
 
 func New(baseURL string) *Client {
 	return &Client{
-		BaseURL: baseURL,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		BaseURL:    baseURL,
+		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		AdminToken: firstNonEmpty(os.Getenv("TUP_ADMIN_TOKEN"), os.Getenv("TUFD_ADMIN_TOKEN")),
+	}
+}
+
+// setAuth sets the OSF-TOKEN header from the Client's configured
+// admin token. Helpers building their own *http.Request (vs. going
+// through do()) call this so they don't need to plumb the token as
+// a parameter.
+func (c *Client) setAuth(req *http.Request) {
+	if c.AdminToken != "" {
+		req.Header.Set("OSF-TOKEN", c.AdminToken)
 	}
 }
 
@@ -330,9 +345,7 @@ func (c *Client) ExportRoleKey(ctx context.Context, repoID, role string) (*Expor
 	if err != nil {
 		return nil, err
 	}
-	if tok := firstNonEmpty(os.Getenv("TUP_ADMIN_TOKEN"), os.Getenv("TUFD_ADMIN_TOKEN")); tok != "" {
-		req.Header.Set("OSF-TOKEN", tok)
-	}
+	c.setAuth(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -482,9 +495,8 @@ type OstreePushStats struct {
 func (c *Client) OstreeInit(ctx context.Context, repoID, adminToken string) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/init", nil)
-	if adminToken != "" {
-		req.Header.Set("OSF-TOKEN", adminToken)
-	}
+	c.setAuth(req)
+	_ = adminToken // kept in signature for back-compat; Client.AdminToken now governs
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -501,9 +513,8 @@ func (c *Client) OstreeInit(ctx context.Context, repoID, adminToken string) erro
 func (c *Client) OstreeHasObject(ctx context.Context, repoID, sha2, rest, adminToken string) bool {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodHead,
 		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/objects/"+sha2+"/"+rest, nil)
-	if adminToken != "" {
-		req.Header.Set("OSF-TOKEN", adminToken)
-	}
+	c.setAuth(req)
+	_ = adminToken // kept in signature for back-compat; Client.AdminToken now governs
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return false
@@ -523,9 +534,8 @@ func (c *Client) OstreePutObject(ctx context.Context, repoID, sha2, rest, adminT
 	}
 	req.ContentLength = size
 	req.Header.Set("Content-Type", "application/octet-stream")
-	if adminToken != "" {
-		req.Header.Set("OSF-TOKEN", adminToken)
-	}
+	c.setAuth(req)
+	_ = adminToken // kept in signature for back-compat; Client.AdminToken now governs
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return false, err
@@ -547,9 +557,8 @@ func (c *Client) OstreePutRef(ctx context.Context, repoID, branch, commitSha, ad
 		c.BaseURL+"/api/v1/user_repo/"+repoID+"/ostree/refs/heads/"+branch,
 		bytes.NewReader([]byte(commitSha+"\n")))
 	req.Header.Set("Content-Type", "text/plain")
-	if adminToken != "" {
-		req.Header.Set("OSF-TOKEN", adminToken)
-	}
+	c.setAuth(req)
+	_ = adminToken // kept in signature for back-compat; Client.AdminToken now governs
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -809,6 +818,7 @@ func (c *Client) AppPush(ctx context.Context, repoID, name, version, by string, 
 	if by != "" {
 		req.Header.Set("X-Updated-By", by)
 	}
+	c.setAuth(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1034,15 +1044,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	// Pick up the admin token from env so every caller of do()
-	// inherits auth — historically PublishTarget + UnpublishTarget
-	// + the wave/config helpers went out unauthenticated and only
-	// the explicit OstreePush + ExportRoleKey paths set the header.
-	// The server's requireAdmin gate still validates the token
-	// value; this just makes sure it's PRESENT on every request.
-	if tok := firstNonEmpty(os.Getenv("TUP_ADMIN_TOKEN"), os.Getenv("TUFD_ADMIN_TOKEN")); tok != "" {
-		req.Header.Set("OSF-TOKEN", tok)
-	}
+	c.setAuth(req)
 	return c.HTTP.Do(req)
 }
 

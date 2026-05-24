@@ -289,3 +289,93 @@ func TestDiscoverOstreeBranch_NestedRef(t *testing.T) {
 		t.Errorf("branch = %q, want lmp-os/intel-corei7-64", got)
 	}
 }
+
+// TestDiscoverImageName_PrefersLmpFactoryImage closes task #65: when
+// the deploy dir contains both initramfs-ostree-image.manifest and
+// lmp-factory-image.manifest, discoverImageName must pick the
+// factory image. Pre-fix the alphabetical scan grabbed
+// initramfs-ostree-image, producing a target whose name didn't match
+// any device hwid + was unreachable.
+func TestDiscoverImageName_PrefersLmpFactoryImage(t *testing.T) {
+	root := t.TempDir()
+	const m = "rb3gen2-core-kit"
+	deploy := filepath.Join(root, "tmp", "deploy", "images", m)
+	if err := os.MkdirAll(deploy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"initramfs-ostree-image",
+		"lmp-factory-image",
+		"lmp-base-image",
+	} {
+		if err := os.WriteFile(
+			filepath.Join(deploy, name+"-"+m+".manifest"),
+			[]byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := discoverImageName(deploy, m)
+	if got != "lmp-factory-image" {
+		t.Errorf("got %q, want lmp-factory-image", got)
+	}
+}
+
+// TestDiscoverImageName_FallsBackToLmpFamily: no factory-image, but
+// an lmp-* image — must pick that over initramfs.
+func TestDiscoverImageName_FallsBackToLmpFamily(t *testing.T) {
+	root := t.TempDir()
+	const m = "raspberrypi4-64"
+	deploy := filepath.Join(root, "tmp", "deploy", "images", m)
+	_ = os.MkdirAll(deploy, 0o700)
+	for _, name := range []string{
+		"initramfs-ostree-image",
+		"lmp-base",
+	} {
+		_ = os.WriteFile(filepath.Join(deploy, name+"-"+m+".manifest"), []byte("x"), 0o600)
+	}
+	got := discoverImageName(deploy, m)
+	if got != "lmp-base" {
+		t.Errorf("got %q, want lmp-base", got)
+	}
+}
+
+// TestDiscoverImageName_SkipsInitramfsLastResort: when ONLY
+// initramfs-* candidates exist, fall back to the default rather than
+// publishing an initramfs as if it were a deployable target.
+func TestDiscoverImageName_SkipsInitramfsLastResort(t *testing.T) {
+	root := t.TempDir()
+	const m = "intel-corei7-64"
+	deploy := filepath.Join(root, "tmp", "deploy", "images", m)
+	_ = os.MkdirAll(deploy, 0o700)
+	_ = os.WriteFile(filepath.Join(deploy, "initramfs-ostree-image-"+m+".manifest"), []byte("x"), 0o600)
+	got := discoverImageName(deploy, m)
+	if got != "lmp-factory-image" {
+		t.Errorf("got %q, want lmp-factory-image (default when only initramfs present)", got)
+	}
+}
+
+// TestIsLongRunningSubcommand locks in the gate for task #66: a -30s
+// global deadline must NOT be applied to subcommands that walk large
+// object stores. Previous global ctx-with-timeout pattern killed
+// yocto-publish at ~13400/26501 objects + at the PUT-ref step.
+func TestIsLongRunningSubcommand(t *testing.T) {
+	cases := map[string]bool{
+		"yocto-publish":   true,
+		"compose-publish": true,
+		"ostree-push":     true,
+		"publish":         true,
+
+		"version":  false,
+		"help":     false,
+		"project":  false,
+		"":         false,
+		"unknown":  false,
+	}
+	for cmd, want := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			if got := isLongRunningSubcommand(cmd); got != want {
+				t.Errorf("isLongRunningSubcommand(%q) = %v, want %v", cmd, got, want)
+			}
+		})
+	}
+}

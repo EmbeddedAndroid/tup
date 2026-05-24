@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -105,7 +106,16 @@ Examples:
 func main() {
 	url := flag.String("url", envOr("TUP_URL", "http://localhost:9001"), "tufd base URL")
 	jsonOut := flag.Bool("json", false, "output JSON")
-	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
+	// -timeout governs per-request deadlines, NOT the lifetime of the
+	// whole subcommand. Long-running operations (yocto-publish,
+	// compose-publish, *-publish anything that walks an ostree repo)
+	// can take many minutes; wrapping the parent context in a single
+	// 30s deadline killed them at object ~13400/26501 + at the
+	// PUT-ref final step. The runner now applies the deadline ONLY
+	// to short interactive subcommands; long-running ones see the
+	// raw signal context and let per-request timeouts inside the
+	// publisher govern.
+	timeout := flag.Duration("timeout", 30*time.Second, "per-request timeout for short subcommands (ignored for *-publish)")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, help) }
 	flag.Parse()
 
@@ -118,8 +128,11 @@ func main() {
 	client := api.New(*url)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, *timeout)
-	defer cancel()
+	if !isLongRunningSubcommand(args[0]) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
 
 	out := output{json: *jsonOut}
 
@@ -656,11 +669,24 @@ func discoverOstreeBranch(repoPath string) (string, error) {
 // discoverImageName looks for a *.manifest in the machine dir (Yocto
 // writes one per built image). Falls back to a sensible default if no
 // manifest is present.
+//
+// Preference order (closes task #65):
+//  1. lmp-factory-image       — the canonical Foundries deployable
+//  2. lmp-*-image / lmp-base  — LmP-family images
+//  3. *factory-image          — vendor-equivalents
+//  4. first alphabetical other than initramfs-* (which is a build
+//     artifact, never the deployable target)
+//
+// Pre-fix the loop just took the first alphabetical entry, which
+// surfaced initramfs-ostree-image ahead of lmp-factory-image on
+// every rb3g2 build — an artifact ID that no device hwid matches,
+// so the published target was unreachable.
 func discoverImageName(machineDir, machine string) string {
 	entries, err := os.ReadDir(machineDir)
 	if err != nil {
 		return "lmp-factory-image"
 	}
+	var candidates []string
 	for _, e := range entries {
 		n := e.Name()
 		if !strings.HasSuffix(n, ".manifest") {
@@ -668,10 +694,39 @@ func discoverImageName(machineDir, machine string) string {
 		}
 		base := strings.TrimSuffix(n, ".manifest")
 		base = strings.TrimSuffix(base, "-"+machine)
-		if base != "" {
-			return base
+		if base == "" {
+			continue
+		}
+		candidates = append(candidates, base)
+	}
+	if len(candidates) == 0 {
+		return "lmp-factory-image"
+	}
+	// Sorted candidates make selection deterministic if multiple
+	// matches occur at the same priority tier.
+	sort.Strings(candidates)
+	for _, want := range []string{"lmp-factory-image", "lmp-base"} {
+		for _, c := range candidates {
+			if c == want {
+				return c
+			}
 		}
 	}
+	// Tier 2/3: prefix matches.
+	for _, prefix := range []string{"lmp-", "factory-"} {
+		for _, c := range candidates {
+			if strings.HasPrefix(c, prefix) {
+				return c
+			}
+		}
+	}
+	// Tier 4: first non-initramfs alphabetical.
+	for _, c := range candidates {
+		if !strings.HasPrefix(c, "initramfs-") {
+			return c
+		}
+	}
+	// All candidates were initramfs-*; fall back to default.
 	return "lmp-factory-image"
 }
 
@@ -2211,4 +2266,18 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// isLongRunningSubcommand returns true for commands that walk
+// large object stores or push ostree repos: those operations can
+// take many minutes and the global -timeout shouldn't kill them.
+// Per-request timeouts inside the api.Client + publisher govern
+// individual HTTP calls so a wedged server is still detected.
+func isLongRunningSubcommand(top string) bool {
+	switch top {
+	case "yocto-publish", "compose-publish", "ostree-push", "publish":
+		return true
+	default:
+		return false
+	}
 }
