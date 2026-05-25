@@ -379,3 +379,53 @@ func TestIsLongRunningSubcommand(t *testing.T) {
 		})
 	}
 }
+
+func TestSplitPositionalVersion(t *testing.T) {
+	stub := func() string { return "STAMP" }
+	cases := []struct {
+		name        string
+		args        []string
+		wantVer     string
+		wantStart   int
+		wantAuto    bool
+	}{
+		{
+			name:      "explicit version",
+			args:      []string{"demo", "lmp", "42", "-ostree-commit", "abc"},
+			wantVer:   "42",
+			wantStart: 3,
+			wantAuto:  false,
+		},
+		{
+			name:      "no version, flags follow",
+			args:      []string{"demo", "lmp", "-ostree-commit", "abc"},
+			wantVer:   "STAMP",
+			wantStart: 2,
+			wantAuto:  true,
+		},
+		{
+			name:      "no version, no flags",
+			args:      []string{"demo", "lmp"},
+			wantVer:   "STAMP",
+			wantStart: 2,
+			wantAuto:  true,
+		},
+		{
+			name:      "version that itself starts with digit",
+			args:      []string{"demo", "lmp", "1779700001"},
+			wantVer:   "1779700001",
+			wantStart: 3,
+			wantAuto:  false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotVer, gotStart, gotAuto := splitPositionalVersion(c.args, stub)
+			if gotVer != c.wantVer || gotStart != c.wantStart || gotAuto != c.wantAuto {
+				t.Errorf("got=(%q,%d,%v) want=(%q,%d,%v)",
+					gotVer, gotStart, gotAuto,
+					c.wantVer, c.wantStart, c.wantAuto)
+			}
+		})
+	}
+}

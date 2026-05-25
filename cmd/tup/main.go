@@ -171,10 +171,20 @@ func main() {
 }
 
 func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
-	if len(args) < 3 {
-		fail(fmt.Errorf("publish needs: <repo-id> <name> <version> [flags]"))
+	if len(args) < 2 {
+		fail(fmt.Errorf("publish needs: <repo-id> <name> [version] [flags]"))
 	}
-	repoID, name, version := args[0], args[1], args[2]
+	repoID, name := args[0], args[1]
+
+	// Version is optional. When omitted (or when arg[2] looks like a
+	// flag, i.e. starts with '-'), default to a unix timestamp. This
+	// matches Foundries' factory-CI convention (versions like
+	// 1779700001) and is collision-free for concurrent operator
+	// publishes. Explicit `tup publish demo lmp 42 ...` still works.
+	version, flagsStart, autoGen := splitPositionalVersion(args, nowUnix)
+	if autoGen {
+		fmt.Fprintf(os.Stderr, "▶ auto-version: %s\n", version)
+	}
 
 	fs := flag.NewFlagSet("publish", flag.ExitOnError)
 	manifestPath := fs.String("manifest", "", "load a build manifest JSON (LmP fields)")
@@ -194,7 +204,7 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	lmpManifestSHA := fs.String("lmp-manifest-sha", "", "lmp-manifest git sha")
 	metaSHA := fs.String("meta-sha", "", "meta-subscriber-overrides git sha")
 	containersSHA := fs.String("containers-sha", "", "containers.git sha")
-	if err := fs.Parse(args[3:]); err != nil {
+	if err := fs.Parse(args[flagsStart:]); err != nil {
 		fail(err)
 	}
 
@@ -323,6 +333,24 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 		fail(err)
 	}
 	out.publishResult(resp)
+}
+
+// nowUnix is a seam for tests; it returns the same string the public
+// caller would have generated when auto-versioning a publish.
+var nowUnix = func() string { return fmt.Sprintf("%d", time.Now().Unix()) }
+
+// splitPositionalVersion implements the version-or-not detection for
+// `tup publish <repo> <name> [version] [flags...]`. Returns the chosen
+// version string, the index in args at which flag parsing should begin,
+// and a bool indicating the version was auto-generated.
+//
+// Rule: if args[2] exists and does not start with '-', treat it as an
+// explicit version. Otherwise auto-generate via now().
+func splitPositionalVersion(args []string, now func() string) (string, int, bool) {
+	if len(args) >= 3 && !strings.HasPrefix(args[2], "-") {
+		return args[2], 3, false
+	}
+	return now(), 2, true
 }
 
 // ostreeRevParse shells to `ostree rev-parse <ref> --repo=<path>` and
