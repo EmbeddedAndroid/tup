@@ -1057,16 +1057,22 @@ func runComposePublish(ctx context.Context, c *api.Client, args []string, out ou
 		fmt.Fprintf(os.Stderr, "    tup publish %s <target-name> <version> \\\n", project)
 		fmt.Fprintf(os.Stderr, "      -ostree-commit <commit> -hardware <hwid> -tags <tag> \\\n")
 		fmt.Fprintf(os.Stderr, "      -app %s=%s\n\n", *name, ref)
-		// Record the publish in tufd's app store too so /api/v1/user_repo/<p>/compose-apps lists it.
-		app, err := c.AppPush(ctx, project, *name, *version, *by, bytes.NewReader(buf.Bytes()))
-		if err != nil {
-			// Non-fatal: artifact is already in the registry; we just
-			// failed to update the app-list. Operator can still publish
-			// a target via the registry ref above.
-			fmt.Fprintf(os.Stderr, "  warning: app-list register failed: %v\n", err)
-		} else {
-			out.appPushResult(project, app)
-		}
+		// Intentionally do NOT call c.AppPush here. AppPush PUT's the
+		// raw bundle.tar.gz to tufd's
+		// /api/v1/user_repo/<p>/compose-apps/<name>/<version>; the
+		// server-side handler in newer tufd builds also writes that
+		// bundle into the OCI registry at /v2/<repo>/manifests/
+		// sha256:<tarball-sha> with content-type application/octet-
+		// stream. That second write tramples the OCI manifest JSON we
+		// just published above, so subsequent composectl pulls fetch
+		// gzip bytes where they expect JSON and aktualizr-lite logs:
+		//
+		//   failed to read app manifest: invalid character '\x1f'
+		//   looking for beginning of value
+		//
+		// (0x1f = gzip magic). The OCI artifact path is sufficient on
+		// its own for device delivery — the registry's /v2/_catalog
+		// + per-repo tag/list endpoints replace the app-store list.
 		return
 	}
 
