@@ -196,6 +196,12 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	hardware := fs.String("hardware", "", "comma-separated hardware ids")
 	tags := fs.String("tags", "", "comma-separated tags")
 	format := fs.String("format", "OSTREE", "OSTREE | BINARY")
+	// -os defaults to "lmp" so every publish lands a labeled Target.
+	// aktualizr-lite cross-checks this against /var/sota/sota.toml
+	// `[pacman].os` (also "lmp" by default from lmp-device-register).
+	// Pass -os "" to explicitly emit an unlabeled Target (current
+	// pre-flag behaviour, for callers relying on aklite's lenient match).
+	osName := fs.String("os", "lmp", "OS family compat label written to Target.custom.os; pass \"\" to omit")
 	uri := fs.String("uri", "", "artifact URI")
 	origURI := fs.String("orig-uri", "", "upstream build URL")
 	imageFile := fs.String("image-file", "", "artifact filename")
@@ -248,6 +254,13 @@ func runPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	}
 	if *format != "OSTREE" || req.TargetFormat == "" {
 		req.TargetFormat = *format
+	}
+	// -os: a flag with default "lmp", so the canonical case stamps the
+	// label. Operators pass -os "" to explicitly omit (lenient publish
+	// = prior behaviour). Flag wins over manifest when the manifest
+	// hasn't supplied one.
+	if isFlagPassed(fs, "os") || req.OS == "" {
+		req.OS = *osName
 	}
 	if *hardware != "" {
 		req.HardwareIDs = splitCSV(*hardware)
@@ -401,6 +414,9 @@ func mergeManifest(dst, src *api.PublishRequest) {
 	if src.TargetFormat != "" {
 		dst.TargetFormat = src.TargetFormat
 	}
+	if src.OS != "" {
+		dst.OS = src.OS
+	}
 	if len(src.HardwareIDs) > 0 {
 		dst.HardwareIDs = src.HardwareIDs
 	}
@@ -445,6 +461,19 @@ func runUnpublish(ctx context.Context, c *api.Client, args []string, out output)
 		fail(err)
 	}
 	out.unpublishResult(key, resp)
+}
+
+// isFlagPassed reports whether `name` appeared on the command line for
+// `fs`. Used to distinguish "operator typed -os ''" (explicit opt-out)
+// from "operator didn't touch -os" (use the default).
+func isFlagPassed(fs *flag.FlagSet, name string) bool {
+	seen := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			seen = true
+		}
+	})
+	return seen
 }
 
 // splitCSV splits a comma-separated list, dropping empty entries.
@@ -809,10 +838,17 @@ func discoverImageName(machineDir, machine string) string {
 func runYoctoPublish(ctx context.Context, c *api.Client, args []string, out output) {
 	fs := flag.NewFlagSet("yocto-publish", flag.ExitOnError)
 	machine := fs.String("machine", "", "MACHINE override (auto-detected if only one machine in tmp/deploy/images/)")
-	imageName := fs.String("name", "", "target name (default: image manifest filename)")
+	imageName := fs.String("name", "", "target name (default: MACHINE)")
 	version := fs.String("version", "", "target version (default: unix timestamp)")
 	tagsArg := fs.String("tags", "devel", "comma-separated tags")
 	hwid := fs.String("hwid", "", "hardware id (default: MACHINE)")
+	// -os: family compat label, lands at Target.custom.os. Defaults
+	// to "lmp" so every yocto-publish ships a labeled Target matching
+	// what lmp-device-register writes to /var/sota/sota.toml. Pass
+	// -os "" to opt out (lenient unlabeled Target, matches the
+	// pre-flag behaviour). Note: DISTRO from the bitbake build is
+	// independent of this OTA compat label — set them separately.
+	osName := fs.String("os", "lmp", "OS family compat label written to Target.custom.os; pass \"\" to omit")
 	branch := fs.String("branch", "", "ostree ref to publish (default: auto-detect)")
 	conc := fs.Int("c", 32, "concurrent ostree uploads")
 	if err := fs.Parse(args); err != nil {
@@ -836,11 +872,11 @@ func runYoctoPublish(ctx context.Context, c *api.Client, args []string, out outp
 	if err != nil {
 		fail(fmt.Errorf("scan build dir: %w", err))
 	}
-	if *imageName == "" {
-		*imageName = info.ImageName
-	}
 	if *hwid == "" {
 		*hwid = info.Machine
+	}
+	if *imageName == "" {
+		*imageName = *hwid
 	}
 	if *branch == "" {
 		*branch = info.BranchName
@@ -881,6 +917,7 @@ func runYoctoPublish(ctx context.Context, c *api.Client, args []string, out outp
 		Name:         *imageName,
 		Version:      *version,
 		TargetFormat: "OSTREE",
+		OS:           *osName,
 		SHA256:       commit,
 		Length:       0,
 		HardwareIDs:  []string{*hwid},

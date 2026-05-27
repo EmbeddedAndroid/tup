@@ -107,6 +107,12 @@ type PublishRequest struct {
 	HardwareIDs  []string          `json:"hardware_ids,omitempty"`
 	Tags         []string          `json:"tags,omitempty"`
 	TargetFormat string            `json:"target_format,omitempty"`
+	// OS is the family compat label, lands at custom.os in the TUF
+	// targets metadata. aklite cross-checks against the device's
+	// /var/sota/sota.toml `[pacman].os` value (default "lmp"). Empty =
+	// unlabeled / lenient matching. Set explicitly via -os to make the
+	// labeling stable.
+	OS           string            `json:"os,omitempty"`
 	SHA256       string            `json:"sha256"`
 	Length       int64             `json:"length,omitempty"`
 	URI          string            `json:"uri,omitempty"`

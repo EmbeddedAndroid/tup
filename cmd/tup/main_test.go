@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,6 +72,46 @@ func TestMergeManifest_FlagsWin(t *testing.T) {
 	// URI was set by manifest and never overridden — must remain.
 	if dst.URI != "old-uri" {
 		t.Errorf("URI = %q, want preserved from manifest", dst.URI)
+	}
+}
+
+// TestMergeManifest_CarriesOS covers the new custom.os flow. A
+// manifest carrying OS seeds dst; an explicit flag still wins after.
+// Empty OS in the manifest does NOT overwrite a previously-set value.
+func TestMergeManifest_CarriesOS(t *testing.T) {
+	dst := api.PublishRequest{Name: "lmp", Version: "42", OS: "lmp"}
+	src := &api.PublishRequest{OS: ""}
+	mergeManifest(&dst, src)
+	if dst.OS != "lmp" {
+		t.Errorf("empty manifest.OS clobbered dst.OS = %q, want lmp", dst.OS)
+	}
+
+	// Manifest with OS seeds when dst is empty.
+	dst2 := api.PublishRequest{Name: "lmp", Version: "42"}
+	src2 := &api.PublishRequest{OS: "qcom-distro-sota"}
+	mergeManifest(&dst2, src2)
+	if dst2.OS != "qcom-distro-sota" {
+		t.Errorf("manifest.OS not seeded into dst, got %q", dst2.OS)
+	}
+}
+
+// TestIsFlagPassed covers the helper that distinguishes "operator
+// typed `-os ''`" (explicit opt-out) from "operator didn't touch -os"
+// (use default). Important because the canonical case wants the flag
+// default to land, but a deliberate empty must propagate through.
+func TestIsFlagPassed(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	_ = fs.String("os", "lmp", "")
+	_ = fs.Parse([]string{}) // no flags passed
+	if isFlagPassed(fs, "os") {
+		t.Error("flag should not appear as passed when defaulted")
+	}
+
+	fs = flag.NewFlagSet("t", flag.ContinueOnError)
+	_ = fs.String("os", "lmp", "")
+	_ = fs.Parse([]string{"-os", ""})
+	if !isFlagPassed(fs, "os") {
+		t.Error("flag should appear as passed even when set to empty string")
 	}
 }
 
