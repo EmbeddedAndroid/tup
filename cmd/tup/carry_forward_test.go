@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/EmbeddedAndroid/tup/internal/api"
 )
 
 func TestFindLatestTargetPicksByVersion(t *testing.T) {
@@ -160,5 +166,92 @@ func TestStripVersionSuffix(t *testing.T) {
 		if got := stripVersionSuffix(in); got != want {
 			t.Errorf("stripVersionSuffix(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestApplyCarryForward_YoctoPublishInheritsApps covers the gap that
+// motivated splitting the carry-forward out: when the yocto agent
+// publishes a new rootfs target (ostree-commit set, no -app flag) it
+// must inherit the compose-apps from the latest matching target for
+// the same (hwid, tag). Without this the device loses every running
+// app on the next rootfs OTA.
+func TestApplyCarryForward_YoctoPublishInheritsApps(t *testing.T) {
+	// Mock the FetchTargets call with a targets.json that already has
+	// an OSTREE target carrying compose-apps for (intel, devel).
+	prior, _ := json.Marshal(map[string]any{
+		"signed": map[string]any{
+			"targets": map[string]any{
+				"baseline-100": map[string]any{
+					"length": 0,
+					"hashes": map[string]string{"sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
+					"custom": map[string]any{
+						"name":         "baseline",
+						"version":      "100",
+						"hardwareIds":  []string{"intel-corei7-64"},
+						"tags":         []string{"devel"},
+						"targetFormat": "OSTREE",
+						"createdAt":    "2026-05-27T10:00:00Z",
+						"docker_compose_apps": map[string]any{
+							"tuf":   map[string]any{"uri": "reg/tuf@sha256:" + strings.Repeat("a", 64)},
+							"hello": map[string]any{"uri": "reg/hello@sha256:" + strings.Repeat("b", 64)},
+						},
+					},
+				},
+			},
+		},
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(prior)
+	}))
+	defer srv.Close()
+	c := api.New(srv.URL)
+
+	// Yocto-publish shape: ostree-commit set, no apps.
+	req := api.PublishRequest{
+		Name:         "intel-corei7-64",
+		Version:      "200",
+		TargetFormat: "OSTREE",
+		SHA256:       "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+		HardwareIDs:  []string{"intel-corei7-64"},
+		Tags:         []string{"devel"},
+	}
+	if err := applyCarryForward(context.Background(), c, "demo", &req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.ComposeApps) != 2 {
+		t.Fatalf("expected 2 inherited apps, got %d: %+v", len(req.ComposeApps), req.ComposeApps)
+	}
+	if !strings.HasPrefix(req.ComposeApps["tuf"], "reg/tuf@sha256:") {
+		t.Errorf("tuf app not inherited: %q", req.ComposeApps["tuf"])
+	}
+	// ostree-commit was supplied — must NOT be clobbered by the carry-forward.
+	if !strings.HasPrefix(req.SHA256, "f00d") {
+		t.Errorf("supplied SHA256 got clobbered: %s", req.SHA256)
+	}
+}
+
+// TestApplyCarryForward_BothSuppliedNoFetch confirms the helper is a
+// no-op (and does no HTTP) when the request is already complete.
+func TestApplyCarryForward_BothSuppliedNoFetch(t *testing.T) {
+	fetched := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	c := api.New(srv.URL)
+
+	req := api.PublishRequest{
+		Name: "x", Version: "1", TargetFormat: "OSTREE",
+		SHA256:      "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+		HardwareIDs: []string{"intel"},
+		Tags:        []string{"devel"},
+		ComposeApps: map[string]string{"a": "reg/a@sha256:" + strings.Repeat("a", 64)},
+	}
+	if err := applyCarryForward(context.Background(), c, "demo", &req); err != nil {
+		t.Fatal(err)
+	}
+	if fetched {
+		t.Error("applyCarryForward should not call FetchTargets when request is already complete")
 	}
 }

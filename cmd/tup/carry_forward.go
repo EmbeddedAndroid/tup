@@ -1,13 +1,68 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/EmbeddedAndroid/tup/internal/api"
 )
+
+// applyCarryForward inherits the missing piece of a publish request
+// from the newest matching (project, hwid, tag) target. Symmetric:
+//   - operator passed -ostree-commit but no -app → inherit apps from
+//     the latest matching target (the yocto-publish case — preserves
+//     a device's already-running compose-app set across a rootfs
+//     rebuild, which would otherwise wipe apps to empty);
+//   - operator passed -app but no -ostree-commit → inherit the
+//     ostree-commit (the app-only republish case);
+//   - both supplied → no inheritance, the request stands;
+//   - neither supplied → fail loudly downstream.
+//
+// Skips when hwid or tag is empty (no key to query on), or when
+// TargetFormat isn't OSTREE (BINARY/compose-only targets have their
+// own lifecycle). Idempotent on a fully-supplied request.
+func applyCarryForward(ctx context.Context, c *api.Client, repoID string, req *api.PublishRequest) error {
+	missingSHA := req.SHA256 == ""
+	missingApps := len(req.ComposeApps) == 0
+	if !missingSHA && !missingApps {
+		return nil
+	}
+	if len(req.HardwareIDs) == 0 || len(req.Tags) == 0 || req.TargetFormat != "OSTREE" {
+		return nil
+	}
+	raw, err := c.FetchTargets(ctx, repoID)
+	if err != nil {
+		return fmt.Errorf("publish: carry-forward targets fetch: %w", err)
+	}
+	base, err := findLatestTarget(raw, req.HardwareIDs[0], req.Tags[0])
+	if err != nil {
+		return fmt.Errorf("publish: carry-forward parse: %w", err)
+	}
+	if base == nil {
+		return nil
+	}
+	if missingSHA {
+		req.SHA256 = base.sha256
+		req.Length = base.length
+		fmt.Fprintf(os.Stderr, "▶ inherit ostree-commit from %s-%s: %s\n",
+			base.name, base.versionStr, base.sha256)
+	}
+	if missingApps && len(base.apps) > 0 {
+		req.ComposeApps = make(map[string]string, len(base.apps))
+		for k, v := range base.apps {
+			req.ComposeApps[k] = v
+		}
+		fmt.Fprintf(os.Stderr, "▶ inherit %d compose-app(s) from %s-%s\n",
+			len(base.apps), base.name, base.versionStr)
+	}
+	return nil
+}
 
 // targetEntry is the trimmed view of a single targets.json target we
 // care about for carry-forward. We parse only the fields needed to
