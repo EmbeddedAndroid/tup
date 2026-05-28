@@ -37,10 +37,11 @@ const (
 )
 
 type ociManifest struct {
-	SchemaVersion int             `json:"schemaVersion"`
-	MediaType     string          `json:"mediaType"`
-	Config        ociDescriptor   `json:"config"`
-	Layers        []ociDescriptor `json:"layers"`
+	SchemaVersion int               `json:"schemaVersion"`
+	MediaType     string            `json:"mediaType"`
+	Config        ociDescriptor     `json:"config"`
+	Layers        []ociDescriptor   `json:"layers"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
 }
 
 type ociDescriptor struct {
@@ -48,6 +49,16 @@ type ociDescriptor struct {
 	Digest    string `json:"digest"`
 	Size      int64  `json:"size"`
 }
+
+// composeAppManifestVersion is the value aktualizr-lite's
+// docker::Manifest verifier expects in annotations["compose-app"].
+// Pinned at "v1" in upstream aktualizr-lite/src/docker/docker.h
+// (constexpr Version{"v1"}). Without this annotation aktualizr-lite
+// throws "Got invalid App manifest, missing a manifest version"
+// the first time isFetched() inspects a freshly-pulled artifact —
+// devices with an existing cache skip the check and don't notice,
+// so the bug only surfaces on fresh fetches (re-register, wipe).
+const composeAppManifestVersion = "v1"
 
 // pushOCIArtifact publishes a compose-app as an OCI artifact to
 // <registry>/<repo>@sha256:<manifest-digest>.
@@ -113,6 +124,16 @@ func pushOCIArtifact(
 				Digest:    "sha256:" + layerDigest,
 				Size:      int64(len(layerBlob)),
 			},
+		},
+		Annotations: map[string]string{
+			// aktualizr-lite's docker::Manifest verifier requires this
+			// exact annotation key + value. Without it isFetched()
+			// throws "Got invalid App manifest, missing a manifest
+			// version" the first time it inspects a freshly-pulled
+			// artifact. Devices with a "trusted" prior cache skip the
+			// check and don't notice the gap, so this bug only
+			// surfaces on a fresh fetch (sql.db wipe / re-register).
+			"compose-app": composeAppManifestVersion,
 		},
 	}
 	manifestBytes, err := json.Marshal(manifest)

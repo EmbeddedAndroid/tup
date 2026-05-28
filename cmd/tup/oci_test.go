@@ -93,6 +93,21 @@ func TestPushOCIArtifactAndPinning(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 		case strings.Contains(r.URL.Path, "/manifests/") && r.Method == "PUT":
 			manifestReceived++
+			// aktualizr-lite's docker::Manifest verifier requires
+			// annotations["compose-app"]="v1". Without it devices
+			// throw "Got invalid App manifest, missing a manifest
+			// version" when isFetched() inspects a fresh artifact.
+			body, _ := io.ReadAll(r.Body)
+			var got struct {
+				Annotations map[string]string `json:"annotations"`
+			}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Errorf("manifest body unmarshal: %v", err)
+			}
+			if v := got.Annotations["compose-app"]; v != "v1" {
+				t.Errorf("manifest missing annotations[compose-app]=v1; got %q in %v",
+					v, got.Annotations)
+			}
 			w.WriteHeader(http.StatusCreated)
 		case strings.Contains(r.URL.Path, "/manifests/") && r.Method == "HEAD":
 			// Image pinning lookup: serve a stable Docker-Content-Digest.
